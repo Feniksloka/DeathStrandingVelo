@@ -1,26 +1,24 @@
 package com.example.deathstrandingvelo
-
-import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
+import kotlin.math.abs
 import android.Manifest
 import android.annotation.SuppressLint
-import android.os.Bundle
-import org.osmdroid.events.MapEventsReceiver
-import org.osmdroid.views.overlay.MapEventsOverlay
-import androidx.compose.material.icons.filled.Settings
-import android.media.AudioManager
-import android.media.AudioFocusRequest
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.os.Bundle
 import android.speech.tts.TextToSpeech
-import androidx.compose.material.icons.filled.Navigation
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Navigation
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,15 +28,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.osmdroid.config.Configuration
+import org.osmdroid.events.MapEventsReceiver
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polygon
 import org.osmdroid.views.overlay.Polyline
@@ -48,37 +50,16 @@ import org.osmdroid.views.overlay.mylocation.IMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import java.net.URL
 import java.util.Locale
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.random.Random
 
-data class CargoTemplate(
-    val name: String,
-    val description: String,
-    val weightKg: Double,
-    val isFragile: Boolean
-)
-
-// 1. СТРУКТУРА ДАННЫХ ДЛЯ ГРУЗА
+data class CargoTemplate(val name: String, val description: String, val weightKg: Double, val isFragile: Boolean)
 enum class CargoStatus { PENDING, COLLECTED, CANCELED }
-
-data class CargoItem(
-    val id: Int,
-    val name: String,
-    val description: String,
-    val weightKg: Double,
-    val isFragile: Boolean,
-    val location: GeoPoint,
-    var status: CargoStatus = CargoStatus.PENDING
-)
-// Класс для Зоны покатушек
-data class RideZone(val name: String, val center: GeoPoint, val radiusMeters: Double)
-// Класс для хранения маневров (поворотов)
+data class CargoItem(val id: Int, val name: String, val description: String, val weightKg: Double, val isFragile: Boolean, val location: GeoPoint, var status: CargoStatus = CargoStatus.PENDING)
+data class CitySector(val id: Int, val center: GeoPoint, var isActive: Boolean = true, var visitCount: Int = 0)
 data class RouteStep(val location: GeoPoint, val instruction: String, var isSpoken: Boolean = false)
-
-// Обновленный результат (теперь сервер будет возвращать еще и шаги)
 data class OsrmResult(val path: List<GeoPoint>, val distanceMeters: Double, val steps: List<RouteStep>)
 
 class MainActivity : ComponentActivity() {
@@ -88,21 +69,13 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    val locationPermissionsState = rememberMultiplePermissionsState(
-                        listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
-                    )
+                    val locationPermissionsState = rememberMultiplePermissionsState(listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION))
                     if (locationPermissionsState.allPermissionsGranted) {
                         MapScreen()
                     } else {
-                        Column(
-                            modifier = Modifier.fillMaxSize(),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
+                        Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                             Text("Для сканера нужен GPS.")
-                            Button(onClick = { locationPermissionsState.launchMultiplePermissionRequest() }) {
-                                Text("Активировать")
-                            }
+                            Button(onClick = { locationPermissionsState.launchMultiplePermissionRequest() }) { Text("Активировать") }
                         }
                     }
                 }
@@ -120,64 +93,62 @@ fun MapScreen() {
     val audioManager = remember { context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager }
     val focusRequest = remember {
         AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            .build()
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()).build()
     }
-    // Отслеживаем готовность
+
     var isTtsReady by remember { mutableStateOf(false) }
+    var ttsPitch by remember { mutableStateOf(0.8f) }
+    var ttsRate by remember { mutableStateOf(0.9f) }
+    var ttsDiagText by remember { mutableStateOf("") }
+    var availableVoices by remember { mutableStateOf<List<android.speech.tts.Voice>>(emptyList()) }
+    var selectedVoiceName by remember { mutableStateOf("") }
+    var isVoiceDropdownExpanded by remember { mutableStateOf(false) }
 
-    // БОЛЬШЕ НИКАКИХ ЖЕСТКИХ ПРИВЯЗОК (Убрали "com.samsung.SMT")
-    // Пусть Android использует то, что выбрано в настройках телефона
-    val tts = remember {
-        TextToSpeech(context) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                isTtsReady = true
-            }
-        }
-    }
+    val tts = remember { TextToSpeech(context) { status -> if (status == TextToSpeech.SUCCESS) isTtsReady = true } }
 
-    // Как только загрузился — ищем приятную женщину
     LaunchedEffect(isTtsReady) {
         if (isTtsReady) {
-            tts.language = Locale("ru")
-            tts.setPitch(0.9f)
+            tts.setLanguage(Locale("ru", "RU"))
+            try {
+                val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
+                ttsPitch = prefs.getFloat("tts_pitch", 0.8f)
+                ttsRate = prefs.getFloat("tts_rate", 0.9f)
+                tts.setPitch(ttsPitch)
+                tts.setSpeechRate(ttsRate)
 
-            // Слушатель: управляем громкостью внешних плееров в реальном времени
+                val voices = tts.voices?.filter { it.locale.language == "ru" } ?: emptyList()
+                availableVoices = voices
+                val savedVoiceName = prefs.getString("saved_voice", null)
+                val voiceToSet = voices.find { it.name == savedVoiceName } ?: voices.firstOrNull { !it.name.contains("network") } ?: voices.firstOrNull()
+                if (voiceToSet != null) {
+                    tts.voice = voiceToSet
+                    selectedVoiceName = voiceToSet.name
+                }
+            } catch (e: Exception) { e.printStackTrace() }
+
             tts.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {
-                    // Жестко приглушаем музыку (Ducking)
-                    audioManager.requestAudioFocus(focusRequest)
-                }
-                override fun onDone(utteranceId: String?) {
-                    // Возвращаем музыку в исходную громкость
-                    audioManager.abandonAudioFocusRequest(focusRequest)
-                }
-                override fun onError(utteranceId: String?) {
-                    audioManager.abandonAudioFocusRequest(focusRequest)
-                }
+                override fun onStart(utteranceId: String?) { audioManager.requestAudioFocus(focusRequest) }
+                override fun onDone(utteranceId: String?) { audioManager.abandonAudioFocusRequest(focusRequest) }
+                override fun onError(utteranceId: String?) { audioManager.abandonAudioFocusRequest(focusRequest) }
             })
         }
     }
 
-    var visitedPoints by remember { mutableStateOf<List<GeoPoint>>(loadVisitedPoints(context)) } // ИСТОРИЯ ДОСТАВОК
+    var visitedPoints by remember { mutableStateOf<List<GeoPoint>>(loadVisitedPoints(context)) }
+    var citySectors by remember { mutableStateOf<List<CitySector>>(loadSectors(context)) }
+    var isGridEditMode by remember { mutableStateOf(false) }
 
-
-    var isFollowMode by remember { mutableStateOf(false) } // Включен ли режим "Навигатор"
-    var currentBearing by remember { mutableStateOf(0f) } // Куда мы сейчас повернуты
-    var shouldInitCamera by remember { mutableStateOf(false) } // Флаг для мгновенного зума при старте
-
+    var isFollowMode by remember { mutableStateOf(false) }
+    var currentBearing by remember { mutableStateOf(0f) }
+    var shouldInitCamera by remember { mutableStateOf(false) }
     var userPosition by remember { mutableStateOf<GeoPoint?>(null) }
+    var hasCenteredOnUser by remember { mutableStateOf(false) }
+
     var cargoList by remember { mutableStateOf<List<CargoItem>>(emptyList()) }
     var routePoints by remember { mutableStateOf<List<GeoPoint>>(emptyList()) }
+    var navSteps by remember { mutableStateOf<List<RouteStep>>(emptyList()) }
+    var lastOffRouteWarningTime by remember { mutableStateOf(0L) }
 
-    var navSteps by remember { mutableStateOf<List<RouteStep>>(emptyList()) } // Шаги навигатора
-    var lastOffRouteWarningTime by remember { mutableStateOf(0L) } // Таймер для защиты от спама "вы сбились с пути"
-    // Мониторинг и UI
     var totalDistanceMeters by remember { mutableStateOf(0.0) }
     var distanceTraveledMeters by remember { mutableStateOf(0.0) }
     var previousLocation by remember { mutableStateOf<android.location.Location?>(null) }
@@ -187,52 +158,33 @@ fun MapScreen() {
     var isLoading by remember { mutableStateOf(false) }
     var hasZoomedToRoute by remember { mutableStateOf(false) }
 
-    // Состояния для диалогов (список и карточка груза)
     var showListDialog by remember { mutableStateOf(false) }
     var selectedCargo by remember { mutableStateOf<CargoItem?>(null) }
-
-    // --- ПЕРЕМЕННЫЕ ДЛЯ ЗОН ПОКАТУШЕК ---
-    // --- ПЕРЕМЕННЫЕ ДЛЯ ЗОН ПОКАТУШЕК ---
-    var savedZones by remember { mutableStateOf<List<RideZone>>(loadZones(context)) } // Теперь грузим из памяти!
-    var showSettingsDialog by remember { mutableStateOf(false) } // Окно настроек
-
-    var selectedZone by remember { mutableStateOf<RideZone?>(null) }
-    var showZoneDialog by remember { mutableStateOf<GeoPoint?>(null) }
-    var newZoneRadius by remember { mutableStateOf(2000f) } // По умолчанию 2 км
-    var newZoneName by remember { mutableStateOf("") }
-    var isDropdownExpanded by remember { mutableStateOf(false) }
+    var showSettingsDialog by remember { mutableStateOf(false) }
 
     Configuration.getInstance().userAgentValue = context.packageName
 
-    // Функция для анонса следующего груза
     val announceNext = {
         val nextCargo = cargoList.firstOrNull { it.status == CargoStatus.PENDING }
         if (nextCargo != null) {
             val fragileWarning = if (nextCargo.isFragile) "Внимание, груз хрупкий." else ""
-            tts.speak(
-                "Следующая цель: ${nextCargo.name}. ${nextCargo.description}. $fragileWarning",
-                TextToSpeech.QUEUE_FLUSH, null, null
-            )
+            tts.speak("Следующая цель: ${nextCargo.name}. ${nextCargo.description}. $fragileWarning", TextToSpeech.QUEUE_FLUSH, null, null)
         } else {
             tts.speak("Все грузы обработаны. Заказ выполнен, возвращайтесь на базу.", TextToSpeech.QUEUE_FLUSH, null, null)
         }
     }
 
-    // Функция обработки груза (собрали или отменили)
     val processCargo = { cargoId: Int, newStatus: CargoStatus ->
         val targetCargo = cargoList.find { it.id == cargoId }
         cargoList = cargoList.map { if (it.id == cargoId) it.copy(status = newStatus) else it }
-
         if (newStatus == CargoStatus.COLLECTED) {
             tts.speak("Груз собран.", TextToSpeech.QUEUE_FLUSH, null, "nav")
-            // ДОБАВЛЯЕМ ТОЧКУ В ИСТОРИЮ
             if (targetCargo != null) {
                 val newHistory = visitedPoints + targetCargo.location
                 visitedPoints = newHistory
                 saveVisitedPoints(context, newHistory)
             }
-        }
-        else if (newStatus == CargoStatus.CANCELED) {
+        } else if (newStatus == CargoStatus.CANCELED) {
             tts.speak("Груз отменен.", TextToSpeech.QUEUE_FLUSH, null, "nav")
         }
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ announceNext() }, 2500)
@@ -252,14 +204,91 @@ fun MapScreen() {
                     myLocOverlay.enableFollowLocation()
                     overlays.add(myLocOverlay)
 
-                    // Обработчик долгих нажатий по карте для создания зон
+                    // --- МАГИЯ КИСТИ (ПЕРЕМЕННЫЕ ДЛЯ РИСОВАНИЯ) ---
+                    var isPainting = false
+                    var paintTargetState = false
+                    var lastPaintedSectorId = -1
+
+                    // 1. Оверлей для отслеживания движения пальца (Рисование)
+                    val paintOverlay = object : org.osmdroid.views.overlay.Overlay() {
+                        override fun onTouchEvent(event: android.view.MotionEvent, mapView: MapView): Boolean {
+                            if (!isGridEditMode) return super.onTouchEvent(event, mapView)
+
+                            when (event.action) {
+                                android.view.MotionEvent.ACTION_DOWN -> {
+                                    isPainting = false // Сбрасываем при новом касании
+                                }
+                                android.view.MotionEvent.ACTION_MOVE -> {
+                                    if (isPainting) {
+                                        val proj = mapView.projection
+                                        val geo = proj.fromPixels(event.x.toInt(), event.y.toInt()) as GeoPoint
+                                        val sector = citySectors.find { it.center.distanceToAsDouble(geo) < 433.0 }
+
+                                        // Если палец зашел на новый гекс - красим его на лету!
+                                        if (sector != null && sector.id != lastPaintedSectorId && sector.isActive != paintTargetState) {
+                                            lastPaintedSectorId = sector.id
+                                            val updated = citySectors.map {
+                                                if (it.id == sector.id) it.copy(isActive = paintTargetState) else it
+                                            }
+                                            citySectors = updated
+                                        }
+                                        return true // Блокируем сдвиг карты, пока рисуем!
+                                    }
+                                }
+                                android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                                    if (isPainting) {
+                                        isPainting = false
+                                        saveSectors(context, citySectors) // Сохраняем в память только когда отпустили палец (чтобы не лагало)
+                                        return true
+                                    }
+                                }
+                            }
+                            return super.onTouchEvent(event, mapView)
+                        }
+                    }
+                    overlays.add(paintOverlay)
+
+                    // 2. Обработчик кликов и долгого нажатия (Активация кисти)
                     val mapEventsReceiver = object : MapEventsReceiver {
-                        override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean = false
+                        override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
+                            if (p != null && isGridEditMode) {
+                                val clickedSector = citySectors.find { it.center.distanceToAsDouble(p) < 433.0 }
+                                if (clickedSector != null) {
+                                    post {
+                                        val updated = citySectors.map { if (it.id == clickedSector.id) it.copy(isActive = !it.isActive) else it }
+                                        citySectors = updated
+                                        saveSectors(context, updated)
+                                    }
+                                }
+                            }
+                            return true
+                        }
+
                         override fun longPressHelper(p: GeoPoint?): Boolean {
-                            if (p != null && !isRouteBuilt) {
-                                post {
-                                    newZoneName = "Зона ${savedZones.size + 1}"
-                                    showZoneDialog = p
+                            if (p != null && isGridEditMode) {
+                                val centerSector = citySectors.find { it.center.distanceToAsDouble(p) < 433.0 }
+                                if (centerSector != null) {
+                                    // ВКЛЮЧАЕМ РЕЖИМ КИСТИ!
+                                    isPainting = true
+                                    paintTargetState = !centerSector.isActive
+                                    lastPaintedSectorId = centerSector.id
+
+                                    post {
+                                        val updated = citySectors.map {
+                                            if (it.id == centerSector.id) it.copy(isActive = paintTargetState) else it
+                                        }
+                                        citySectors = updated
+                                    }
+
+                                    // Легкая вибрация, чтобы ты понял, что кисть активирована
+                                    try {
+                                        val vibrator = context.getSystemService(android.content.Context.VIBRATOR_SERVICE) as android.os.Vibrator
+                                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                            vibrator.vibrate(android.os.VibrationEffect.createOneShot(50, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+                                        } else {
+                                            vibrator.vibrate(50)
+                                        }
+                                    } catch (e: Exception) {}
                                 }
                             }
                             return true
@@ -274,46 +303,32 @@ fun MapScreen() {
                         }
                     }
 
-                    // Слушатель GPS (Геофенсинг)
-                    // Слушатель GPS (Геофенсинг)
                     myLocProvider.startLocationProvider(object : IMyLocationConsumer {
                         override fun onLocationChanged(loc: android.location.Location?, source: IMyLocationProvider?) {
                             if (loc != null) {
                                 post {
                                     val currentGeo = GeoPoint(loc.latitude, loc.longitude)
                                     userPosition = currentGeo
-
-                                    // ЕСЛИ GPS ПЕРЕДАЕТ НАПРАВЛЕНИЕ ДВИЖЕНИЯ — ЗАПОМИНАЕМ ЕГО
-                                    if (loc.hasBearing()) {
-                                        currentBearing = loc.bearing
-                                    }
+                                    if (loc.hasBearing()) currentBearing = loc.bearing
 
                                     if (isRouteBuilt) {
-                                        // Считаем дистанцию
                                         if (previousLocation != null) {
                                             distanceTraveledMeters += previousLocation!!.distanceTo(loc)
-                                            // 1. ПРОВЕРКА ОТКЛОНЕНИЯ ОТ МАРШРУТА
                                             var minDistanceToLine = Double.MAX_VALUE
                                             for (pt in routePoints) {
                                                 val d = currentGeo.distanceToAsDouble(pt)
                                                 if (d < minDistanceToLine) minDistanceToLine = d
                                             }
-
-                                            // Если отъехали дальше 70 метров от линии
                                             if (minDistanceToLine > 70.0) {
                                                 val now = System.currentTimeMillis()
-                                                if (now - lastOffRouteWarningTime > 20000) { // Не спамим (раз в 20 сек)
+                                                if (now - lastOffRouteWarningTime > 20000) {
                                                     tts.speak("Внимание! Вы сбились с маршрута.", TextToSpeech.QUEUE_FLUSH, null, "nav")
                                                     lastOffRouteWarningTime = now
                                                 }
                                             }
-
-                                            // 2. TURN-BY-TURN НАВИГАЦИЯ
                                             val nextStep = navSteps.firstOrNull { !it.isSpoken }
                                             if (nextStep != null) {
                                                 val distToTurn = currentGeo.distanceToAsDouble(nextStep.location)
-
-                                                // Если до поворота 20-120 метров — говорим
                                                 if (distToTurn in 20.0..120.0) {
                                                     val roundedDist = (distToTurn / 10).roundToInt() * 10
                                                     tts.speak("Через $roundedDist метров ${nextStep.instruction}", TextToSpeech.QUEUE_ADD, null, "nav")
@@ -324,7 +339,6 @@ fun MapScreen() {
                                                         navSteps = updatedList
                                                     }
                                                 } else if (distToTurn < 20.0) {
-                                                    // Проехали поворот, помечаем как "сказанный"
                                                     val stepIndex = navSteps.indexOf(nextStep)
                                                     if (stepIndex != -1) {
                                                         val updatedList = navSteps.toMutableList()
@@ -335,12 +349,9 @@ fun MapScreen() {
                                             }
                                         }
                                         previousLocation = loc
-
-                                        // ГЕОФЕНСИНГ: Проверяем радиус 25 метров
                                         val nextCargo = cargoList.firstOrNull { it.status == CargoStatus.PENDING }
                                         if (nextCargo != null) {
-                                            val distToCargo = currentGeo.distanceToAsDouble(nextCargo.location)
-                                            if (distToCargo <= 25.0) {
+                                            if (currentGeo.distanceToAsDouble(nextCargo.location) <= 25.0) {
                                                 processCargo(nextCargo.id, CargoStatus.COLLECTED)
                                             }
                                         }
@@ -352,38 +363,75 @@ fun MapScreen() {
                 }
             },
             update = { mapView ->
-                // ЭТОТ БЛОК УПРАВЛЯЕТ КАМЕРОЙ НАВИГАТОРА
                 if (isFollowMode && userPosition != null) {
                     mapView.controller.animateTo(userPosition)
-                    mapView.mapOrientation = -currentBearing // Поворот карты против угла движения
+                    mapView.mapOrientation = -currentBearing
                 } else if (!isFollowMode) {
-                    mapView.mapOrientation = 0f // Возвращаем север наверх, если режим выключен
+                    mapView.mapOrientation = 0f
                 }
 
                 if (shouldInitCamera) {
                     shouldInitCamera = false
-                    mapView.controller.setZoom(18.0) // Приближаем вплотную к игроку
+                    mapView.controller.setZoom(18.0)
                     if (userPosition != null) mapView.controller.animateTo(userPosition)
                 }
 
-                mapView.overlays.removeAll { it is Marker || it is Polyline || it is Polygon || it is MapEventsOverlay }
-
-                // Рисуем зоны
-                savedZones.forEach { zone ->
-                    val zonePolygon = Polygon(mapView).apply {
-                        points = Polygon.pointsAsCircle(zone.center, zone.radiusMeters)
-                        fillPaint.color = android.graphics.Color.parseColor("#330088FF")
-                        outlinePaint.color = android.graphics.Color.parseColor("#0088FF")
-                        outlinePaint.strokeWidth = 3f
-                    }
-                    mapView.overlays.add(zonePolygon)
+                if (userPosition != null && !hasCenteredOnUser) {
+                    hasCenteredOnUser = true
+                    mapView.controller.setZoom(16.0)
+                    mapView.controller.animateTo(userPosition)
                 }
 
-                // --- 1. ТРЕХЦВЕТНАЯ ОТРИСОВКА ЛИНИИ МАРШРУТА ---
+                mapView.overlays.removeAll { it is Marker || it is Polyline || it is Polygon }
+
+                // 3. ОТРИСОВКА СЕТКИ ГОРОДА (ШЕСТИУГОЛЬНИКИ)
+                if (isGridEditMode || !isRouteBuilt) {
+                    citySectors.forEach { sector ->
+                        val hexPolygon = Polygon(mapView).apply {
+                            val pts = mutableListOf<GeoPoint>()
+                            for (i in 0..5) {
+                                // ТУТ ТОЖЕ СТАВИМ 500.0, чтобы размер рисунка совпал с физикой!
+                                pts.add(getPointAtAngle(sector.center, 525.0, 30.0 + 60.0 * i))
+                            }
+                            points = pts
+
+                            if (sector.isActive) {
+                                val alpha = maxOf(10, 68 - (sector.visitCount * 10))
+                                val hexAlpha = alpha.toString(16).padStart(2, '0')
+                                fillPaint.color = android.graphics.Color.parseColor("#${hexAlpha}00FF00")
+                                outlinePaint.color = android.graphics.Color.parseColor("#4400FF00")
+                            } else {
+                                fillPaint.color = android.graphics.Color.parseColor("#33FF0000")
+                                outlinePaint.color = android.graphics.Color.parseColor("#88FF0000")
+                            }
+                            outlinePaint.strokeWidth = 3f
+                        }
+                        mapView.overlays.add(hexPolygon)
+
+                        if (sector.isActive) {
+                            val textMarker = Marker(mapView).apply {
+                                position = sector.center
+                                icon = createCustomMarker(context, sector.visitCount, android.graphics.Color.parseColor("#00AA00"))
+                                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                                infoWindow = null // УБИВАЕМ ПУСТЫЕ БЕЛЫЕ ПУЗЫРИ!
+
+                                // Заставляем цифру переключать цвет гекса при клике
+                                setOnMarkerClickListener { _, _ ->
+                                    if (isGridEditMode) {
+                                        val updated = citySectors.map { if (it.id == sector.id) it.copy(isActive = !it.isActive) else it }
+                                        citySectors = updated
+                                        saveSectors(context, updated)
+                                    }
+                                    true // Поглощаем клик
+                                }
+                            }
+                            mapView.overlays.add(textMarker)
+                        }
+                    }
+                }
+
                 if (routePoints.isNotEmpty()) {
                     var closestUserIndex = 0
-
-                    // Ищем ближайшую к нам точку на всем маршруте (где мы сейчас)
                     if (userPosition != null) {
                         var minDt = Double.MAX_VALUE
                         for (i in routePoints.indices) {
@@ -394,14 +442,10 @@ fun MapScreen() {
                             }
                         }
                     }
-
                     val nextCargo = cargoList.firstOrNull { it.status == CargoStatus.PENDING }
                     var nextCargoIndex = routePoints.size - 1
-
-                    // Ищем точку на линии маршрута, где лежит следующий груз
                     if (nextCargo != null) {
                         var minDtCargo = Double.MAX_VALUE
-                        // Ищем вперед от текущего положения, чтобы не запутаться в петлях маршрута
                         for (i in closestUserIndex until routePoints.size) {
                             val d = routePoints[i].distanceToAsDouble(nextCargo.location)
                             if (d < minDtCargo) {
@@ -410,54 +454,43 @@ fun MapScreen() {
                             }
                         }
                     }
-
-                    // А. ПРОЙДЕННЫЙ ПУТЬ (Серый)
                     if (closestUserIndex > 0) {
                         val traveledLine = Polyline(mapView).apply {
                             setPoints(routePoints.subList(0, closestUserIndex + 1))
-                            outlinePaint.color = android.graphics.Color.parseColor("#888888") // Серый
+                            outlinePaint.color = android.graphics.Color.parseColor("#888888")
                             outlinePaint.strokeWidth = 12f
                         }
                         mapView.overlays.add(traveledLine)
                     }
-
-                    // Б. ТЕКУЩИЙ УЧАСТОК ДО БЛИЖАЙШЕГО ГРУЗА (Ярко-зеленый)
                     if (closestUserIndex < nextCargoIndex) {
                         val currentLine = Polyline(mapView).apply {
                             setPoints(routePoints.subList(closestUserIndex, nextCargoIndex + 1))
-                            outlinePaint.color = android.graphics.Color.parseColor("#00FF00") // Зеленый
+                            outlinePaint.color = android.graphics.Color.parseColor("#00FF00")
                             outlinePaint.strokeWidth = 12f
                         }
                         mapView.overlays.add(currentLine)
                     }
-
-                    // В. ОСТАВШИЙСЯ ПУТЬ КО ВСЕМ СЛЕДУЮЩИМ ГРУЗАМ (Оранжевый)
                     if (nextCargoIndex < routePoints.size - 1) {
                         val futureLine = Polyline(mapView).apply {
                             setPoints(routePoints.subList(nextCargoIndex, routePoints.size))
-                            outlinePaint.color = android.graphics.Color.parseColor("#FFA500") // Оранжевый
+                            outlinePaint.color = android.graphics.Color.parseColor("#FFA500")
                             outlinePaint.strokeWidth = 12f
                         }
                         mapView.overlays.add(futureLine)
                     }
-
                     if (!hasZoomedToRoute) {
                         hasZoomedToRoute = true
                         mapView.zoomToBoundingBox(BoundingBox.fromGeoPoints(routePoints), true, 150)
                     }
                 }
 
-                // --- 2. ОТРИСОВКА ГРУЗОВ С ЦИФРАМИ ---
                 val nextCargoId = cargoList.firstOrNull { it.status == CargoStatus.PENDING }?.id
-
                 cargoList.forEach { cargo ->
                     if (cargo.status == CargoStatus.PENDING) {
                         val isNext = (cargo.id == nextCargoId)
-
                         val mainColorStr = if (isNext) "#00FF00" else "#FFA500"
                         val mainColor = android.graphics.Color.parseColor(mainColorStr)
                         val circleColor = android.graphics.Color.parseColor(if (isNext) "#4400FF00" else "#44FFA500")
-
                         val circlePolygon = Polygon(mapView).apply {
                             points = Polygon.pointsAsCircle(cargo.location, 25.0)
                             fillPaint.color = circleColor
@@ -465,12 +498,11 @@ fun MapScreen() {
                             outlinePaint.strokeWidth = 3f
                         }
                         mapView.overlays.add(circlePolygon)
-
                         val marker = Marker(mapView).apply {
                             position = cargo.location
                             title = cargo.name
                             setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                            icon = createCustomMarker(context, cargo.id, mainColor) // Используем нашу функцию рисования кругов с цифрами
+                            icon = createCustomMarker(context, cargo.id, mainColor)
                             setOnMarkerClickListener { _, _ ->
                                 selectedCargo = cargo
                                 true
@@ -480,25 +512,22 @@ fun MapScreen() {
                     }
                 }
 
-
-// РИСУЕМ СТРЕЛОЧКУ НАВИГАТОРА НАД НАШЕЙ ПОЗИЦИЕЙ
                 if (userPosition != null) {
                     val userArrowMarker = Marker(mapView).apply {
                         position = userPosition
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                         icon = createUserArrowMarker(context)
-                        setFlat(false) // Важно! Стрелка всегда будет смотреть строго ВВЕРХ экрана
+                        setFlat(false)
+                        infoWindow = null // Отключаем пузырь
+                        setOnMarkerClickListener { _, _ -> true } // Игнорируем клики по себе
                     }
                     mapView.overlays.add(userArrowMarker)
                 }
-
                 mapView.invalidate()
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // КНОПКА СПИСКА ГРУЗОВ (Появляется, когда построен маршрут)
-        // КНОПКА ПОЛНОЦЕННОГО НАВИГАТОРА (Следование и автоповорот)
         if (isRouteBuilt) {
             FloatingActionButton(
                 onClick = {
@@ -506,63 +535,26 @@ fun MapScreen() {
                     if (isFollowMode) shouldInitCamera = true
                 },
                 containerColor = if (isFollowMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(end = 16.dp, bottom = 190.dp) // Кнопка встанет ровно над кнопкой списка
-            ) {
-                Icon(Icons.Filled.Navigation, contentDescription = "Режим навигации")
-            }
+                modifier = Modifier.align(Alignment.CenterEnd).padding(end = 16.dp, bottom = 190.dp)
+            ) { Icon(Icons.Filled.Navigation, contentDescription = "Режим навигации") }
         }
 
-        // ТОП ПАНЕЛЬ: Генерация заказа
-        if (userPosition != null && !isRouteBuilt) {
+        if (userPosition != null && !isRouteBuilt && !isGridEditMode) {
             Card(modifier = Modifier.align(Alignment.TopCenter).padding(16.dp).fillMaxWidth(0.9f)) {
                 Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    // Заголовок и кнопка настроек
                     Box(modifier = Modifier.fillMaxWidth()) {
                         Text("Генерация заказа", style = MaterialTheme.typography.titleMedium, modifier = Modifier.align(Alignment.Center))
-                        IconButton(
-                            onClick = { showSettingsDialog = true },
-                            modifier = Modifier.align(Alignment.CenterEnd).offset(x = 8.dp, y = (-8).dp)
-                        ) {
+                        IconButton(onClick = { showSettingsDialog = true }, modifier = Modifier.align(Alignment.CenterEnd).offset(x = 8.dp, y = (-8).dp)) {
                             Icon(Icons.Filled.Settings, contentDescription = "Настройки")
                         }
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf(30, 60, 90).forEach { mins ->
-                            FilterChip(
-                                selected = selectedMinutes == mins,
-                                onClick = { selectedMinutes = mins },
-                                label = { Text("$mins мин") }
-                            )
-                        }
-                    }
-                    // ВЫПАДАЮЩЕЕ МЕНЮ ВЫБОРА ЗОНЫ
-                    if (savedZones.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        ExposedDropdownMenuBox(
-                            expanded = isDropdownExpanded,
-                            onExpandedChange = { isDropdownExpanded = !isDropdownExpanded }
-                        ) {
-                            OutlinedTextField(
-                                value = selectedZone?.name ?: "Вокруг меня (Случайно)",
-                                onValueChange = {},
-                                readOnly = true,
-                                label = { Text("Где катаемся?") },
-                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = isDropdownExpanded) },
-                                modifier = Modifier.menuAnchor().fillMaxWidth()
-                            )
-                            ExposedDropdownMenu(expanded = isDropdownExpanded, onDismissRequest = { isDropdownExpanded = false }) {
-                                DropdownMenuItem(text = { Text("Вокруг меня (Случайно)") }, onClick = { selectedZone = null; isDropdownExpanded = false })
-                                savedZones.forEach { zone ->
-                                    DropdownMenuItem(text = { Text(zone.name) }, onClick = { selectedZone = zone; isDropdownExpanded = false })
-                                }
-                            }
+                        listOf(30, 60, 90, 120).forEach { mins ->
+                            FilterChip(selected = selectedMinutes == mins, onClick = { selectedMinutes = mins }, label = { Text("$mins мин") })
                         }
                     }
                     Spacer(modifier = Modifier.height(12.dp))
-
                     if (isLoading) {
                         CircularProgressIndicator()
                     } else {
@@ -571,40 +563,29 @@ fun MapScreen() {
                                 val start = userPosition ?: return@Button
                                 isLoading = true
                                 coroutineScope.launch {
-                                    generateSmartRoute(start, selectedMinutes, selectedZone, visitedPoints) { bestPoints, route, totalDistance, generatedSteps ->
-                                        // 1. БЕЗОПАСНАЯ ЧТЕНИЕ БАЗЫ ДАННЫХ (Защита от вылетов)
+                                    generateSmartRoute(start, selectedMinutes, citySectors, visitedPoints) { success, errorMsg, bestPoints, route, totalDistance, generatedSteps, chosenIds ->
+                                        if (!success) {
+                                            isLoading = false
+                                            android.widget.Toast.makeText(context, errorMsg, android.widget.Toast.LENGTH_LONG).show()
+                                            return@generateSmartRoute
+                                        }
+
+                                        val updatedSectors = citySectors.map { if (it.id in chosenIds) it.copy(visitCount = it.visitCount + 1) else it }
+                                        citySectors = updatedSectors
+                                        saveSectors(context, updatedSectors)
+
                                         val allTemplates: List<CargoTemplate> = try {
                                             val jsonString = context.assets.open("cargo_db.json").bufferedReader().use { it.readText() }
                                             val templateType = object : TypeToken<List<CargoTemplate>>() {}.type
                                             Gson().fromJson(jsonString, templateType)
                                         } catch (e: Exception) {
-                                            e.printStackTrace()
-                                            // Если файла нет или в нем ошибка, отдаем резервный список
-                                            listOf(
-                                                CargoTemplate("Аварийный груз", "Файл базы данных не найден. Проверь папку assets.", 5.0, false),
-                                                CargoTemplate("Утерянный контейнер", "Резервная генерация.", 2.5, true)
-                                            )
+                                            listOf(CargoTemplate("Аварийный груз", "База данных не найдена.", 5.0, false), CargoTemplate("Утерянный контейнер", "Резервная генерация.", 2.5, true))
                                         }
 
-                                        // 2. Перемешиваем базу
                                         val shuffledTemplates = allTemplates.shuffled()
-
-                                        // 3. Привязываем грузы (если точек больше чем грузов, они пойдут по кругу)
                                         cargoList = bestPoints.mapIndexed { index, pt ->
-                                            val template = if (shuffledTemplates.isNotEmpty()) {
-                                                shuffledTemplates[index % shuffledTemplates.size]
-                                            } else {
-                                                CargoTemplate("Пусто", "Пусто", 0.0, false)
-                                            }
-
-                                            CargoItem(
-                                                id = index + 1,
-                                                name = template.name,
-                                                description = template.description,
-                                                weightKg = template.weightKg,
-                                                isFragile = template.isFragile,
-                                                location = pt
-                                            )
+                                            val template = if (shuffledTemplates.isNotEmpty()) shuffledTemplates[index % shuffledTemplates.size] else CargoTemplate("Пусто", "Пусто", 0.0, false)
+                                            CargoItem(index + 1, template.name, template.description, template.weightKg, template.isFragile, pt)
                                         }
 
                                         routePoints = route
@@ -612,33 +593,21 @@ fun MapScreen() {
                                         totalDistanceMeters = totalDistance
                                         distanceTraveledMeters = 0.0
                                         previousLocation = null
-
-                                        // --- НАСТРОЙКА НАВИГАТОРА ПО УМОЛЧАНИЮ ---
                                         isFollowMode = true
                                         shouldInitCamera = true
-                                        hasZoomedToRoute = true // Отключаем старый зум на всю карту
+                                        hasZoomedToRoute = true
 
-                                        // Разворачиваем карту к самой первой точке маршрута сразу!
                                         val firstPt = route.firstOrNull()
-                                        if (start != null && firstPt != null) {
-                                            currentBearing = getBearingBetween(start, firstPt)
-                                        }
-                                        // ----------------------------------------
+                                        if (firstPt != null) currentBearing = getBearingBetween(start, firstPt)
 
                                         isRouteBuilt = true
                                         isLoading = false
 
                                         val tKm = ((totalDistance / 1000.0) * 10).roundToInt() / 10.0
-
-                                        // Вытаскиваем самый первый поворот маршрута
                                         val firstInstruction = generatedSteps.firstOrNull()?.instruction ?: "следуйте по маршруту"
-
-                                        // Четвертый параметр "nav" ОБЯЗАТЕЛЕН для приглушения музыки!
                                         tts.speak("Маршрут $tKm километров построен. Старт движения. Через 50 метров $firstInstruction.", TextToSpeech.QUEUE_FLUSH, null, "nav")
-
                                         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ announceNext() }, 5000)
-
-                                        }
+                                    }
                                 }
                             },
                             modifier = Modifier.fillMaxWidth()
@@ -648,7 +617,6 @@ fun MapScreen() {
             }
         }
 
-        // БОТТОМ ПАНЕЛЬ: Мониторинг
         if (isRouteBuilt) {
             Card(
                 modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp).fillMaxWidth(0.9f),
@@ -659,18 +627,35 @@ fun MapScreen() {
                     val totalKm = ((totalDistanceMeters / 1000.0) * 100).roundToInt() / 100.0
                     val traveledKm = ((distanceTraveledMeters / 1000.0) * 100).roundToInt() / 100.0
                     val remainingKm = (((totalDistanceMeters - distanceTraveledMeters).coerceAtLeast(0.0)) / 1000.0 * 100).roundToInt() / 100.0
-
                     Text("🏁 Длина: $totalKm км | 🚴 Проехано: $traveledKm км")
                     Text("📦 Осталось маршрута: $remainingKm км", color = if (remainingKm > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error)
-
                     val pendingCount = cargoList.count { it.status == CargoStatus.PENDING }
                     Text("📦 Грузов осталось: $pendingCount / ${cargoList.size}")
                 }
             }
         }
+
+        if (!isRouteBuilt) {
+            FloatingActionButton(
+                onClick = {
+                    if (citySectors.isEmpty() && userPosition != null) {
+                        val newGrid = generateCityGrid(userPosition!!)
+                        citySectors = newGrid
+                        saveSectors(context, newGrid)
+                    }
+                    isGridEditMode = !isGridEditMode
+
+                    // ПОДСКАЗКА ПРИ ВКЛЮЧЕНИИ РЕЖИМА
+                    if (isGridEditMode) {
+                        android.widget.Toast.makeText(context, "Клик - 1 гекс\nУдержание - закрасить область (2км)", android.widget.Toast.LENGTH_LONG).show()
+                    }
+                },
+                containerColor = if (isGridEditMode) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.secondaryContainer,
+                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 16.dp)
+            ) { Icon(if (isGridEditMode) Icons.Filled.List else Icons.Filled.Settings, contentDescription = "Сетка") }
+        }
     }
 
-    // ДИАЛОГ: Список всех грузов
     if (showListDialog) {
         AlertDialog(
             onDismissRequest = { showListDialog = false },
@@ -679,20 +664,12 @@ fun MapScreen() {
                 LazyColumn(modifier = Modifier.fillMaxWidth()) {
                     items(cargoList) { cargo ->
                         Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp)
-                                .clickable {
-                                    showListDialog = false
-                                    selectedCargo = cargo
-                                },
-                            colors = CardDefaults.cardColors(
-                                containerColor = when (cargo.status) {
-                                    CargoStatus.PENDING -> MaterialTheme.colorScheme.surfaceVariant
-                                    CargoStatus.COLLECTED -> androidx.compose.ui.graphics.Color(0xFFCCFFCC)
-                                    CargoStatus.CANCELED -> androidx.compose.ui.graphics.Color(0xFFFFCCCC)
-                                }
-                            )
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { showListDialog = false; selectedCargo = cargo },
+                            colors = CardDefaults.cardColors(containerColor = when (cargo.status) {
+                                CargoStatus.PENDING -> MaterialTheme.colorScheme.surfaceVariant
+                                CargoStatus.COLLECTED -> androidx.compose.ui.graphics.Color(0xFFCCFFCC)
+                                CargoStatus.CANCELED -> androidx.compose.ui.graphics.Color(0xFFFFCCCC)
+                            })
                         ) {
                             Column(modifier = Modifier.padding(8.dp)) {
                                 Text(cargo.name, style = MaterialTheme.typography.titleSmall)
@@ -702,13 +679,10 @@ fun MapScreen() {
                     }
                 }
             },
-            confirmButton = {
-                TextButton(onClick = { showListDialog = false }) { Text("Закрыть") }
-            }
+            confirmButton = { TextButton(onClick = { showListDialog = false }) { Text("Закрыть") } }
         )
     }
 
-    // ДИАЛОГ: Детали конкретного груза (Ручное управление)
     if (selectedCargo != null) {
         val cargo = selectedCargo!!
         AlertDialog(
@@ -726,168 +700,197 @@ fun MapScreen() {
             },
             confirmButton = {
                 if (cargo.status == CargoStatus.PENDING) {
-                    Button(onClick = {
-                        processCargo(cargo.id, CargoStatus.COLLECTED)
-                        selectedCargo = null
-                    }) { Text("Собрать") }
+                    Button(onClick = { processCargo(cargo.id, CargoStatus.COLLECTED); selectedCargo = null }) { Text("Собрать") }
                 }
             },
             dismissButton = {
                 if (cargo.status == CargoStatus.PENDING) {
-                    OutlinedButton(onClick = {
-                        processCargo(cargo.id, CargoStatus.CANCELED)
-                        selectedCargo = null
-                    }) { Text("Отменить (Скип)") }
+                    OutlinedButton(onClick = { processCargo(cargo.id, CargoStatus.CANCELED); selectedCargo = null }) { Text("Отменить (Скип)") }
                 } else {
                     TextButton(onClick = { selectedCargo = null }) { Text("Закрыть") }
                 }
             }
         )
     }
-    // ДИАЛОГ: Создание новой зоны
-    if (showZoneDialog != null) {
-        AlertDialog(
-            onDismissRequest = { showZoneDialog = null },
-            title = { Text("Создать зону покатушек") },
-            text = {
-                Column {
-                    OutlinedTextField(value = newZoneName, onValueChange = { newZoneName = it }, label = { Text("Название зоны") })
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("Радиус: ${(newZoneRadius / 1000).roundToInt()} км", style = MaterialTheme.typography.bodyMedium)
-                    Slider(
-                        value = newZoneRadius,
-                        onValueChange = { newZoneRadius = it },
-                        valueRange = 1000f..10000f // От 1 до 10 км
-                    )
-                }
-            },
-            confirmButton = {
-                Button(onClick = {
-                    val newZones = savedZones + RideZone(newZoneName, showZoneDialog!!, newZoneRadius.toDouble())
-                    savedZones = newZones
-                    saveZones(context, newZones) // Записываем в телефон!
-                    showZoneDialog = null
-                }) { Text("Сохранить") }
-            },
-            dismissButton = {
-                TextButton(onClick = { showZoneDialog = null }) { Text("Отмена") }
-            }
-        )
-    }
-    // ДИАЛОГ: Настройки и управление зонами
-    // ДИАЛОГ: Настройки терминала
+
     if (showSettingsDialog) {
         AlertDialog(
             onDismissRequest = { showSettingsDialog = false },
             title = { Text("Настройки терминала") },
             text = {
-                Column {
-                    // --- РАЗДЕЛ ЗОН ---
-                    Text("Зоны доставки", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                val scrollState = rememberScrollState()
+                Column(modifier = Modifier.verticalScroll(scrollState)) {
+                    Text("Голосовой ассистент", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
                     Spacer(modifier = Modifier.height(4.dp))
-                    Button(
-                        onClick = {
-                            if (userPosition != null) {
-                                newZoneName = "Новая зона ${savedZones.size + 1}"
-                                showZoneDialog = userPosition
-                                showSettingsDialog = false
-                            } else {
-                                android.widget.Toast.makeText(context, "Ждем GPS...", android.widget.Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("Создать зону вокруг меня") }
+                    Button(onClick = {
+                        try {
+                            val intent = android.content.Intent("com.android.settings.TTS_SETTINGS")
+                            intent.flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                            context.startActivity(intent)
+                        } catch (e: Exception) { android.widget.Toast.makeText(context, "Не удалось открыть настройки", android.widget.Toast.LENGTH_SHORT).show() }
+                    }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)) { Text("Выбрать движок Samsung в системе") }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(onClick = {
+                        try {
+                            val pm = context.packageManager
+                            val intent = android.content.Intent("android.intent.action.TTS_SERVICE")
+                            val resolveInfos = pm.queryIntentServices(intent, 0)
+                            val allEngines = resolveInfos.joinToString("\n") { it.serviceInfo.packageName }
+                            ttsDiagText = "Текущий:\n${tts.defaultEngine}\n\nУстановлены:\n$allEngines"
+                        } catch (e: Exception) { ttsDiagText = "Ошибка сканирования" }
+                    }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Диагностика движков TTS") }
 
-                    if (savedZones.isNotEmpty()) {
-                        LazyColumn(modifier = Modifier.heightIn(max = 150.dp)) {
-                            items(savedZones) { zone ->
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(zone.name)
-                                    TextButton(onClick = {
-                                        val newZ = savedZones.filter { it != zone }
-                                        savedZones = newZ; saveZones(context, newZ)
-                                        if (selectedZone == zone) selectedZone = null
-                                    }) { Text("Удал.", color = MaterialTheme.colorScheme.error) }
+                    if (availableVoices.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        ExposedDropdownMenuBox(expanded = isVoiceDropdownExpanded, onExpandedChange = { isVoiceDropdownExpanded = !isVoiceDropdownExpanded }) {
+                            OutlinedTextField(value = selectedVoiceName, onValueChange = {}, readOnly = true, label = { Text("Выберите голос") }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = isVoiceDropdownExpanded) }, modifier = Modifier.menuAnchor().fillMaxWidth())
+                            ExposedDropdownMenu(expanded = isVoiceDropdownExpanded, onDismissRequest = { isVoiceDropdownExpanded = false }) {
+                                availableVoices.forEachIndexed { index, voice ->
+                                    DropdownMenuItem(text = { Text("Голос ${index + 1} (${voice.name})") }, onClick = {
+                                        tts.voice = voice; selectedVoiceName = voice.name; isVoiceDropdownExpanded = false
+                                        context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putString("saved_voice", voice.name).apply()
+                                        tts.speak("Голос установлен. Проверка связи.", TextToSpeech.QUEUE_FLUSH, null, "test")
+                                    })
                                 }
                             }
                         }
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text("Тон (Роботизация): ${((ttsPitch * 10).roundToInt() / 10f)}", style = MaterialTheme.typography.bodyMedium)
+                        Slider(value = ttsPitch, onValueChange = { ttsPitch = it }, onValueChangeFinished = {
+                            tts.setPitch(ttsPitch)
+                            context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putFloat("tts_pitch", ttsPitch).apply()
+                            tts.speak("Тон системы изменен", TextToSpeech.QUEUE_FLUSH, null, "test")
+                        }, valueRange = 0.1f..2.0f)
+                        Text("Скорость речи: ${((ttsRate * 10).roundToInt() / 10f)}", style = MaterialTheme.typography.bodyMedium)
+                        Slider(value = ttsRate, onValueChange = { ttsRate = it }, onValueChangeFinished = {
+                            tts.setSpeechRate(ttsRate)
+                            context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putFloat("tts_rate", ttsRate).apply()
+                            tts.speak("Скорость системы изменена", TextToSpeech.QUEUE_FLUSH, null, "test")
+                        }, valueRange = 0.1f..2.0f)
+                    } else {
+                        Text("Доступные голоса не найдены", color = MaterialTheme.colorScheme.error)
                     }
 
                     HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
-
-                    // --- РАЗДЕЛ СИСТЕМЫ ---
-                    Text("Система (В разработке)", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                    Text("Система", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
                     Spacer(modifier = Modifier.height(4.dp))
-                    Text("Уникальных доставок в базе: ${visitedPoints.size}")
-                    Button(
-                        onClick = {
-                            visitedPoints = emptyList()
-                            saveVisitedPoints(context, emptyList())
-                            android.widget.Toast.makeText(context, "История очищена", android.widget.Toast.LENGTH_SHORT).show()
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("Сбросить историю мест (500м)") }
+                    Button(onClick = {
+                        citySectors = emptyList()
+                        saveSectors(context, emptyList())
+                        android.widget.Toast.makeText(context, "Сетка сброшена", android.widget.Toast.LENGTH_SHORT).show()
+                    }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error), modifier = Modifier.fillMaxWidth()) { Text("Сбросить Хиральную сеть") }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Button(onClick = {
+                        visitedPoints = emptyList()
+                        saveVisitedPoints(context, emptyList())
+                        android.widget.Toast.makeText(context, "История очищена", android.widget.Toast.LENGTH_SHORT).show()
+                    }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error), modifier = Modifier.fillMaxWidth()) { Text("Сбросить историю мест (500м)") }
                 }
             },
             confirmButton = { TextButton(onClick = { showSettingsDialog = false }) { Text("Закрыть") } }
         )
     }
+
+    if (ttsDiagText.isNotEmpty()) {
+        AlertDialog(onDismissRequest = { ttsDiagText = "" }, title = { Text("Вскрытие показало:") }, text = { Text(ttsDiagText) }, confirmButton = { Button(onClick = { ttsDiagText = "" }) { Text("Закрыть") } })
+    }
 }
 
 suspend fun generateSmartRoute(
-    start: GeoPoint, minutes: Int, targetZone: RideZone?, visitedHistory: List<GeoPoint>,
-    onResult: (List<GeoPoint>, List<GeoPoint>, Double, List<RouteStep>) -> Unit
+    start: GeoPoint, minutes: Int, sectors: List<CitySector>, visitedHistory: List<GeoPoint>,
+    onResult: (Boolean, String, List<GeoPoint>, List<GeoPoint>, Double, List<RouteStep>, List<Int>) -> Unit
 ) {
+    // 12 км/ч = 12 км за 60 минут
     val targetDist = (minutes / 60.0) * 12.0 * 1000.0
-    var edges = (targetDist / 3000.0).roundToInt().coerceAtLeast(3)
-    var curRadius = (targetDist / 1.3) / edges / (2 * sin(Math.PI / edges))
-    var best: OsrmResult? = null; var bestPts: List<GeoPoint> = emptyList(); var minDiff = Double.MAX_VALUE
+    val activeSectors = sectors.filter { it.isActive }
 
-    // Увеличили попытки до 40, чтобы было больше шансов найти место вдали от старых точек
-    for (attempt in 1..40) {
-        val cAngle = Random.nextDouble(0.0, 360.0)
-        val center = targetZone?.center ?: getPointAtAngle(start, curRadius, cAngle)
-        val radForPts = targetZone?.radiusMeters ?: curRadius
-        val attPts = mutableListOf<GeoPoint>()
-        for (i in 0 until edges) attPts.add(getPointAtAngle(center, radForPts, cAngle + 180.0 + (i * (360.0 / edges))))
+    if (activeSectors.size < 3) {
+        onResult(false, "Включите минимум 3 зеленых гекса на карте!", emptyList(), emptyList(), 0.0, emptyList(), emptyList())
+        return
+    }
 
-        // --- ПРОВЕРКА НА 500 МЕТРОВ ---
-        var isTooClose = false
-        // Строгий фильтр работает только первые 30 попыток (чтобы не зависнуть, если вся карта пройдена)
-        if (attempt <= 30 && visitedHistory.isNotEmpty()) {
-            for (pt in attPts) {
-                if (visitedHistory.any { it.distanceToAsDouble(pt) < 500.0 }) {
-                    isTooClose = true; break
+    var bestRes: OsrmResult? = null
+    var chosenSectorIds = listOf<Int>()
+    var currentRadiusMod = 1.0
+
+    for (attempt in 1..15) { // 15 попыток, чтобы точно подобрать идеальный километраж
+        // 1. ИДЕАЛЬНАЯ ГЕОМЕТРИЯ: Строим треугольник нужного размера вокруг дома
+        val radius = (targetDist / (2 * Math.PI)) * currentRadiusMod
+        val startAngle = Random.nextDouble(0.0, 360.0)
+
+        val idealPt1 = getPointAtAngle(start, radius, startAngle)
+        val idealPt2 = getPointAtAngle(start, radius * 1.2, startAngle + 120.0)
+        val idealPt3 = getPointAtAngle(start, radius, startAngle + 240.0)
+
+        // 2. ПОИСК ГЕКСОВ: Ищем реальные гексы рядом с идеальными точками
+        // ШТРАФ ЗА ВИЗИТЫ: Если ты там был, гекс кажется алгоритму "дальше" на 1.5 км
+        fun findBestSector(idealPt: GeoPoint, excludeIds: List<Int>): CitySector? {
+            return activeSectors
+                .filter { it.id !in excludeIds }
+                .minByOrNull { sector ->
+                    val dist = sector.center.distanceToAsDouble(idealPt)
+                    dist + (sector.visitCount * 1500.0) // Штраф за посещаемость!
                 }
+        }
+
+        val s1 = findBestSector(idealPt1, emptyList())
+        val s2 = if (s1 != null) findBestSector(idealPt2, listOf(s1.id)) else null
+        val s3 = if (s1 != null && s2 != null) findBestSector(idealPt3, listOf(s1.id, s2.id)) else null
+
+        if (s1 == null || s2 == null || s3 == null) continue
+
+        val currentChosen = listOf(s1, s2, s3)
+        val waypoints = listOf(start, s1.center, s2.center, s3.center, start)
+
+        // 3. СТРОИМ МАРШРУТ
+        val res = fetchOSRMRoute(waypoints)
+        if (res != null) {
+            // 4. ЖЕСТКАЯ ПРОВЕРКА ДИСТАНЦИИ
+            // Если маршрут длиннее чем надо на 35% - бракуем и сужаем круг!
+            if (res.distanceMeters <= targetDist * 1.35) {
+                bestRes = res
+                chosenSectorIds = currentChosen.map { it.id }
+                break
+            } else {
+                currentRadiusMod *= 0.75 // Сжимаем треугольник на 25% и пробуем снова
             }
         }
-        if (isTooClose) continue // Точка слишком близко! Бросаем этот вариант и крутим рулетку дальше.
+    }
 
-        attPts[0] = start; attPts.add(start)
+    if (bestRes == null) {
+        onResult(false, "Не удалось проложить маршрут на $minutes мин. Увеличьте время или включите больше гексов рядом с домом.", emptyList(), emptyList(), 0.0, emptyList(), emptyList())
+        return
+    }
 
-        val res = fetchOSRMRoute(attPts)
-        if (res != null) {
-            val diff = abs(res.distanceMeters - targetDist)
-            if (diff < minDiff) { minDiff = diff; best = res; bestPts = attPts }
-            if (diff < targetDist * 0.15) break
-            if (res.distanceMeters > targetDist * 1.3) curRadius *= 0.9
+    // 5. ГРУЗЫ КАЖДЫЕ 3-5 КМ ПРЯМО НА ДОРОГЕ
+    val cargoPoints = mutableListOf<GeoPoint>()
+    var currentSegmentDist = 0.0
+
+    // Первый груз появится через случайное расстояние от 3 до 5 км
+    var nextTarget = Random.nextDouble(3000.0, 5000.0)
+
+    for (i in 0 until bestRes.path.size - 1) {
+        val d = bestRes.path[i].distanceToAsDouble(bestRes.path[i+1])
+        currentSegmentDist += d
+        if (currentSegmentDist >= nextTarget) {
+            cargoPoints.add(bestRes.path[i+1]) // Кидаем груз ровно на дорогу!
+            currentSegmentDist = 0.0
+            nextTarget = Random.nextDouble(3000.0, 5000.0) // Следующий груз снова через 3-5 км
         }
     }
-    if (best != null && best.distanceMeters <= targetDist * 1.4) onResult(bestPts.drop(1).dropLast(1), best.path, best.distanceMeters, best.steps)
-    else onResult(emptyList(), emptyList(), 0.0, emptyList())
-}
 
+    // Гарантируем, что хоть один груз есть
+    if (cargoPoints.isEmpty() && bestRes.path.size > 2) {
+        cargoPoints.add(bestRes.path[bestRes.path.size / 2])
+    }
+
+    onResult(true, "", cargoPoints, bestRes.path, bestRes.distanceMeters, bestRes.steps, chosenSectorIds)
+}
 
 suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Dispatchers.IO) {
     try {
         val coords = points.joinToString(";") { "${it.longitude},${it.latitude}" }
-        // Добавлен параметр &steps=true для запроса маневров поворотов
-        val url = URL("https://router.project-osrm.org/route/v1/driving/$coords?overview=full&geometries=geojson&steps=true")
+        val url = URL("https://router.project-osrm.org/route/v1/cycling/$coords?overview=full&geometries=geojson&steps=true")
         val conn = url.openConnection() as java.net.HttpURLConnection
         conn.setRequestProperty("User-Agent", "BikeStrandingApp MVP")
         if (conn.responseCode != 200) return@withContext null
@@ -895,7 +898,6 @@ suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Di
         if (json.getString("code") != "Ok") return@withContext null
 
         val route = json.getJSONArray("routes").getJSONObject(0)
-
         val path = mutableListOf<GeoPoint>()
         val coordsArray = route.getJSONObject("geometry").getJSONArray("coordinates")
         for (i in 0 until coordsArray.length()) {
@@ -911,7 +913,6 @@ suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Di
                 val modifier = maneuver.optString("modifier", "")
                 val locArray = maneuver.getJSONArray("location")
                 val stepGeo = GeoPoint(locArray.getDouble(1), locArray.getDouble(0))
-
                 var instruction = ""
                 when (modifier) {
                     "right", "sharp right", "slight right" -> instruction = "поверните направо"
@@ -926,82 +927,81 @@ suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Di
     return@withContext null
 }
 
-fun getPointAtAngle(center: GeoPoint, dist: Double, angle: Double): GeoPoint {
-    val rad = 111300.0
-    val dLat = (dist * cos(Math.toRadians(angle))) / rad
-    val dLon = (dist * sin(Math.toRadians(angle))) / (rad * cos(Math.toRadians(center.latitude)))
-    return GeoPoint(center.latitude + dLat, center.longitude + dLon)
-}// Вычисление направления между двумя точками (чтобы повернуть карту на старте)
-
-
 fun getBearingBetween(p1: GeoPoint, p2: GeoPoint): Float {
     val loc1 = android.location.Location("").apply { latitude = p1.latitude; longitude = p1.longitude }
     val loc2 = android.location.Location("").apply { latitude = p2.latitude; longitude = p2.longitude }
     return loc1.bearingTo(loc2)
 }
 
-// Рисование кастомной стрелочки навигатора
 fun createUserArrowMarker(context: android.content.Context): android.graphics.drawable.Drawable {
     val bitmap = android.graphics.Bitmap.createBitmap(80, 80, android.graphics.Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bitmap)
-    val paint = android.graphics.Paint().apply {
-        color = android.graphics.Color.parseColor("#007AFF") // Яркий навигационный синий
-        style = android.graphics.Paint.Style.FILL
-        isAntiAlias = true
-    }
-    val path = android.graphics.Path().apply {
-        moveTo(40f, 15f)   // Нос стрелки
-        lineTo(65f, 65f)   // Правый хвост
-        lineTo(40f, 50f)   // Внутренний балансир
-        lineTo(15f, 65f)   // Левый хвост
-        close()
-    }
+    val paint = android.graphics.Paint().apply { color = android.graphics.Color.parseColor("#007AFF"); style = android.graphics.Paint.Style.FILL; isAntiAlias = true }
+    val path = android.graphics.Path().apply { moveTo(40f, 15f); lineTo(65f, 65f); lineTo(40f, 50f); lineTo(15f, 65f); close() }
     canvas.drawPath(path, paint)
     return android.graphics.drawable.BitmapDrawable(context.resources, bitmap)
 }
 
-// --- ФУНКЦИИ ДЛЯ ПАМЯТИ ---
-fun saveZones(context: android.content.Context, zones: List<RideZone>) {
-    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
-    prefs.edit().putString("saved_zones", Gson().toJson(zones)).apply()
-}
-
-fun loadZones(context: android.content.Context): List<RideZone> {
-    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
-    val json = prefs.getString("saved_zones", null) ?: return emptyList()
-    return try {
-        Gson().fromJson(json, object : TypeToken<List<RideZone>>() {}.type)
-    } catch (e: Exception) { emptyList() }
-}
-
-// --- ГЕНЕРАТОР МАРКЕРОВ С ЦИФРАМИ ---
 fun createCustomMarker(context: android.content.Context, number: Int, color: Int): android.graphics.drawable.Drawable {
     val bitmap = android.graphics.Bitmap.createBitmap(80, 80, android.graphics.Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bitmap)
-    val paint = android.graphics.Paint().apply {
-        this.color = color
-        style = android.graphics.Paint.Style.FILL
-        isAntiAlias = true
-    }
-    // Рисуем цветной круг
+    val paint = android.graphics.Paint().apply { this.color = color; style = android.graphics.Paint.Style.FILL; isAntiAlias = true }
     canvas.drawCircle(40f, 40f, 35f, paint)
-
-    // Рисуем белую цифру
     paint.color = android.graphics.Color.WHITE
     paint.textSize = 40f
     paint.textAlign = android.graphics.Paint.Align.CENTER
     canvas.drawText(number.toString(), 40f, 53f, paint)
-
     return android.graphics.drawable.BitmapDrawable(context.resources, bitmap)
 }
 
-// --- ПАМЯТЬ ДЛЯ ИСТОРИИ ПОЕЗДОК (500м) ---
+fun saveSectors(context: android.content.Context, sectors: List<CitySector>) {
+    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
+    prefs.edit().putString("city_sectors", Gson().toJson(sectors)).apply()
+}
+
+fun loadSectors(context: android.content.Context): List<CitySector> {
+    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
+    val json = prefs.getString("city_sectors", null) ?: return emptyList()
+    return try { Gson().fromJson(json, object : TypeToken<List<CitySector>>() {}.type) } catch (e: Exception) { emptyList() }
+}
+fun generateCityGrid(center: GeoPoint): List<CitySector> {
+    val sectors = mutableListOf<CitySector>()
+    var id = 0
+    val R = 500.0 // Радиус гекса (500 метров)
+    val hexWidth = Math.sqrt(3.0) * R
+    val vertSpacing = 1.5 * R
+
+    // 22 кольца по 500м = 11 км во все стороны (диаметр 22 км)
+    val rings = 22
+    for (row in -rings..rings) {
+        for (col in -rings..rings) {
+            // Смещение для идеальной стыковки сот (как кирпичная кладка)
+            val xOffset = if (row % 2 != 0) hexWidth / 2.0 else 0.0
+            val xDist = (col * hexWidth) + xOffset
+            val yDist = row * vertSpacing
+
+            // Вычисляем координаты центра гекса
+            val ptY = getPointAtAngle(center, abs(yDist), if (yDist > 0) 0.0 else 180.0)
+            val hexCenter = getPointAtAngle(ptY, abs(xDist), if (xDist > 0) 90.0 else 270.0)
+
+            // Обрезаем всё, что дальше 11 км от старта, чтобы получился ровный огромный круг
+            if (center.distanceToAsDouble(hexCenter) <= 11000.0) {
+                sectors.add(CitySector(id++, hexCenter, true, 0))
+            }
+        }
+    }
+    return sectors
+}
 fun saveVisitedPoints(context: android.content.Context, points: List<GeoPoint>) {
-    // Сохраняем координаты как простой список словарей
     val json = Gson().toJson(points.map { mapOf("lat" to it.latitude, "lon" to it.longitude) })
     context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putString("visited_points", json).apply()
 }
-
+fun getPointAtAngle(center: GeoPoint, dist: Double, angle: Double): GeoPoint {
+    val rad = 111300.0
+    val dLat = (dist * cos(Math.toRadians(angle))) / rad
+    val dLon = (dist * sin(Math.toRadians(angle))) / (rad * cos(Math.toRadians(center.latitude)))
+    return GeoPoint(center.latitude + dLat, center.longitude + dLon)
+}
 fun loadVisitedPoints(context: android.content.Context): List<GeoPoint> {
     val json = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getString("visited_points", null) ?: return emptyList()
     return try {
