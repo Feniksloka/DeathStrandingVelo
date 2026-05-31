@@ -55,9 +55,14 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.random.Random
 
-data class CargoTemplate(val name: String, val description: String, val weightKg: Double, val isFragile: Boolean)
+
+data class CargoTemplate(val name: String, val description: String, val weightKg: Double, val isFragile: Boolean, val baseXp: Int = 100)
+data class CargoItem(val id: Int, val name: String, val description: String, val weightKg: Double, val isFragile: Boolean, val location: GeoPoint, val xpReward: Int, var status: CargoStatus = CargoStatus.PENDING)
+
+// НОВЫЙ КЛАСС ДЛЯ УРОВНЕЙ
+data class LevelTemplate(val level: Int, val title: String, val requiredXp: Int)
+
 enum class CargoStatus { PENDING, COLLECTED, CANCELED }
-data class CargoItem(val id: Int, val name: String, val description: String, val weightKg: Double, val isFragile: Boolean, val location: GeoPoint, var status: CargoStatus = CargoStatus.PENDING)
 data class CitySector(val id: Int, val center: GeoPoint, var isActive: Boolean = true, var visitCount: Int = 0)
 data class RouteStep(val location: GeoPoint, val instruction: String, var isSpoken: Boolean = false)
 data class OsrmResult(val path: List<GeoPoint>, val distanceMeters: Double, val steps: List<RouteStep>)
@@ -95,7 +100,28 @@ fun MapScreen() {
         AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
             .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()).build()
     }
+    var playerXp by remember { mutableStateOf(loadPlayerXp(context)) }
 
+    // Загружаем уровни из JSON или генерируем идеальную кривую по умолчанию
+    val levelsDb by remember { mutableStateOf(
+        try {
+            val jsonString = context.assets.open("levels_db.json").bufferedReader().use { it.readText() }
+            Gson().fromJson<List<LevelTemplate>>(jsonString, object : TypeToken<List<LevelTemplate>>() {}.type)
+        } catch (e: Exception) {
+            // Идеальная квадратичная прогрессия, если файла нет
+            (0..30).map { lvl ->
+                val title = when(lvl) {
+                    0 -> "Новичок"
+                    in 1..9 -> "Младший курьер"
+                    in 10..19 -> "Специалист доставки"
+                    in 20..29 -> "Элитный курьер"
+                    else -> "Мастер курьер"
+                }
+                val xp = if (lvl == 0) 0 else (lvl * lvl * 50) + (lvl * 100)
+                LevelTemplate(lvl, "$title $lvl", xp)
+            }
+        }
+    )}
     var isTtsReady by remember { mutableStateOf(false) }
     var ttsPitch by remember { mutableStateOf(0.8f) }
     var ttsRate by remember { mutableStateOf(0.9f) }
@@ -177,17 +203,32 @@ fun MapScreen() {
     val processCargo = { cargoId: Int, newStatus: CargoStatus ->
         val targetCargo = cargoList.find { it.id == cargoId }
         cargoList = cargoList.map { if (it.id == cargoId) it.copy(status = newStatus) else it }
-        if (newStatus == CargoStatus.COLLECTED) {
-            tts.speak("Груз собран.", TextToSpeech.QUEUE_FLUSH, null, "nav")
-            if (targetCargo != null) {
-                val newHistory = visitedPoints + targetCargo.location
-                visitedPoints = newHistory
-                saveVisitedPoints(context, newHistory)
+
+        if (newStatus == CargoStatus.COLLECTED && targetCargo != null) {
+            // Считаем старый уровень
+            val oldLevel = levelsDb.lastOrNull { playerXp >= it.requiredXp } ?: levelsDb.first()
+
+            // Начисляем опыт!
+            playerXp += targetCargo.xpReward
+            savePlayerXp(context, playerXp)
+
+            // Считаем новый уровень
+            val newLevel = levelsDb.lastOrNull { playerXp >= it.requiredXp } ?: levelsDb.first()
+
+            if (newLevel.level > oldLevel.level) {
+                tts.speak("Груз доставлен. Уровень повышен! Теперь вы: ${newLevel.title}.", TextToSpeech.QUEUE_FLUSH, null, "nav")
+            } else {
+                tts.speak("Груз доставлен. Получено ${targetCargo.xpReward} опыта.", TextToSpeech.QUEUE_FLUSH, null, "nav")
             }
+
+            val newHistory = visitedPoints + targetCargo.location
+            visitedPoints = newHistory
+            saveVisitedPoints(context, newHistory)
+
         } else if (newStatus == CargoStatus.CANCELED) {
             tts.speak("Груз отменен.", TextToSpeech.QUEUE_FLUSH, null, "nav")
         }
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ announceNext() }, 2500)
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ announceNext() }, 3500)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -585,8 +626,9 @@ fun MapScreen() {
                                         val shuffledTemplates = allTemplates.shuffled()
                                         cargoList = bestPoints.mapIndexed { index, pt ->
                                             val template = if (shuffledTemplates.isNotEmpty()) shuffledTemplates[index % shuffledTemplates.size] else CargoTemplate("Пусто", "Пусто", 0.0, false)
-                                            CargoItem(index + 1, template.name, template.description, template.weightKg, template.isFragile, pt)
-                                        }
+                                            // Даем базовый опыт + бонус за хрупкость + случайный бонус от 10 до 50 XP
+                                            val xpReward = template.baseXp + (if (template.isFragile) 50 else 0) + Random.nextInt(10, 50)
+                                            CargoItem(index + 1, template.name, template.description, template.weightKg, template.isFragile, pt, xpReward)   }
 
                                         routePoints = route
                                         navSteps = generatedSteps
@@ -617,20 +659,45 @@ fun MapScreen() {
             }
         }
 
+        // БОТТОМ ПАНЕЛЬ: Мониторинг
         if (isRouteBuilt) {
             Card(
                 modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp).fillMaxWidth(0.9f),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.9f))
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f))
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("📱 ОДЕКАДЕК: МОНИТОРИНГ", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                    // --- ПРОФИЛЬ И ОПЫТ ---
+                    val currentLevel = levelsDb.lastOrNull { playerXp >= it.requiredXp } ?: levelsDb.first()
+                    val nextLevel = levelsDb.firstOrNull { it.level == currentLevel.level + 1 }
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("⭐ ${currentLevel.title}", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                        Text("$playerXp XP", style = MaterialTheme.typography.bodyMedium)
+                    }
+
+                    if (nextLevel != null) {
+                        val progress = (playerXp - currentLevel.requiredXp).toFloat() / (nextLevel.requiredXp - currentLevel.requiredXp).toFloat()
+                        LinearProgressIndicator(
+                            progress = progress,
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                            color = MaterialTheme.colorScheme.primary,
+                            trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
+                        )
+                        Text("До следующего уровня: ${nextLevel.requiredXp - playerXp} XP", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    } else {
+                        Text("Максимальный уровень достигнут!", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                    }
+
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+                    // --- СТАТИСТИКА ПОЕЗДКИ ---
                     val totalKm = ((totalDistanceMeters / 1000.0) * 100).roundToInt() / 100.0
                     val traveledKm = ((distanceTraveledMeters / 1000.0) * 100).roundToInt() / 100.0
                     val remainingKm = (((totalDistanceMeters - distanceTraveledMeters).coerceAtLeast(0.0)) / 1000.0 * 100).roundToInt() / 100.0
-                    Text("🏁 Длина: $totalKm км | 🚴 Проехано: $traveledKm км")
-                    Text("📦 Осталось маршрута: $remainingKm км", color = if (remainingKm > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error)
+                    Text("🏁 Маршрут: $traveledKm / $totalKm км")
+
                     val pendingCount = cargoList.count { it.status == CargoStatus.PENDING }
-                    Text("📦 Грузов осталось: $pendingCount / ${cargoList.size}")
+                    Text("📦 Грузов осталось: $pendingCount / ${cargoList.size}", color = if (pendingCount > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary)
                 }
             }
         }
@@ -1008,4 +1075,11 @@ fun loadVisitedPoints(context: android.content.Context): List<GeoPoint> {
         val list = Gson().fromJson<List<Map<String, Double>>>(json, object : TypeToken<List<Map<String, Double>>>() {}.type)
         list.map { GeoPoint(it["lat"]!!, it["lon"]!!) }
     } catch (e: Exception) { emptyList() }
+}
+fun savePlayerXp(context: android.content.Context, xp: Int) {
+    context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putInt("player_xp", xp).apply()
+}
+
+fun loadPlayerXp(context: android.content.Context): Int {
+    return context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getInt("player_xp", 0)
 }
