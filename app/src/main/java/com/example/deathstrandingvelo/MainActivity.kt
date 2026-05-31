@@ -64,7 +64,14 @@ data class LevelTemplate(val level: Int, val title: String, val requiredXp: Int)
 
 enum class CargoStatus { PENDING, COLLECTED, CANCELED }
 data class CitySector(val id: Int, val center: GeoPoint, var isActive: Boolean = true, var visitCount: Int = 0)
-data class RouteStep(val location: GeoPoint, val instruction: String, var isSpoken: Boolean = false)
+// Умный класс маневров (помнит, о чем уже предупредил)
+data class RouteStep(
+    val location: GeoPoint,
+    val instruction: String,
+    var announced500: Boolean = false,
+    var announced100: Boolean = false,
+    var announcedNow: Boolean = false
+)
 data class OsrmResult(val path: List<GeoPoint>, val distanceMeters: Double, val steps: List<RouteStep>)
 
 class MainActivity : ComponentActivity() {
@@ -355,38 +362,59 @@ fun MapScreen() {
                                     if (isRouteBuilt) {
                                         if (previousLocation != null) {
                                             distanceTraveledMeters += previousLocation!!.distanceTo(loc)
+                                            // 1. ПРОВЕРКА ОТКЛОНЕНИЯ ОТ МАРШРУТА (Теперь по отрезкам!)
                                             var minDistanceToLine = Double.MAX_VALUE
-                                            for (pt in routePoints) {
-                                                val d = currentGeo.distanceToAsDouble(pt)
-                                                if (d < minDistanceToLine) minDistanceToLine = d
+                                            if (routePoints.size > 1) {
+                                                for (i in 0 until routePoints.size - 1) {
+                                                    val d = getDistanceToSegment(currentGeo, routePoints[i], routePoints[i+1])
+                                                    if (d < minDistanceToLine) minDistanceToLine = d
+                                                }
                                             }
-                                            if (minDistanceToLine > 70.0) {
+
+                                            // Увеличили допуск до 100 метров (GPS телефона может прыгать в кармане)
+                                            if (minDistanceToLine > 100.0) {
                                                 val now = System.currentTimeMillis()
-                                                if (now - lastOffRouteWarningTime > 20000) {
+                                                if (now - lastOffRouteWarningTime > 20000) { // Не спамим (раз в 20 сек)
                                                     tts.speak("Внимание! Вы сбились с маршрута.", TextToSpeech.QUEUE_FLUSH, null, "nav")
                                                     lastOffRouteWarningTime = now
                                                 }
                                             }
-                                            val nextStep = navSteps.firstOrNull { !it.isSpoken }
+                                            // 2. TURN-BY-TURN НАВИГАЦИЯ (3 стадии предупреждения)
+                                            val nextStep = navSteps.firstOrNull { !it.announcedNow }
                                             if (nextStep != null) {
                                                 val distToTurn = currentGeo.distanceToAsDouble(nextStep.location)
-                                                if (distToTurn in 20.0..120.0) {
-                                                    val roundedDist = (distToTurn / 10).roundToInt() * 10
-                                                    tts.speak("Через $roundedDist метров ${nextStep.instruction}", TextToSpeech.QUEUE_ADD, null, "nav")
-                                                    val stepIndex = navSteps.indexOf(nextStep)
-                                                    if (stepIndex != -1) {
-                                                        val updatedList = navSteps.toMutableList()
-                                                        updatedList[stepIndex] = nextStep.copy(isSpoken = true)
-                                                        navSteps = updatedList
-                                                    }
-                                                } else if (distToTurn < 20.0) {
-                                                    val stepIndex = navSteps.indexOf(nextStep)
-                                                    if (stepIndex != -1) {
-                                                        val updatedList = navSteps.toMutableList()
-                                                        updatedList[stepIndex] = nextStep.copy(isSpoken = true)
-                                                        navSteps = updatedList
-                                                    }
+                                                val stepIndex = navSteps.indexOf(nextStep)
+                                                val updatedList = navSteps.toMutableList()
+                                                var changed = false
+
+                                                // Стадия 1: Дальнее предупреждение (от 300 до 600 метров)
+                                                if (distToTurn in 300.0..600.0 && !nextStep.announced500) {
+                                                    val rounded = (distToTurn / 50).roundToInt() * 50
+                                                    tts.speak("Через $rounded метров ${nextStep.instruction}", TextToSpeech.QUEUE_ADD, null, "nav")
+                                                    updatedList[stepIndex] = nextStep.copy(announced500 = true)
+                                                    changed = true
                                                 }
+                                                // Стадия 2: Ближнее предупреждение (от 50 до 150 метров)
+                                                else if (distToTurn in 50.0..150.0 && !nextStep.announced100) {
+                                                    val rounded = (distToTurn / 10).roundToInt() * 10
+                                                    tts.speak("Через $rounded метров ${nextStep.instruction}", TextToSpeech.QUEUE_ADD, null, "nav")
+                                                    updatedList[stepIndex] = nextStep.copy(announced500 = true, announced100 = true)
+                                                    changed = true
+                                                }
+                                                // Стадия 3: Прямо на повороте (меньше 25 метров)
+                                                else if (distToTurn < 25.0 && !nextStep.announcedNow) {
+                                                    tts.speak(nextStep.instruction, TextToSpeech.QUEUE_ADD, null, "nav")
+                                                    updatedList[stepIndex] = nextStep.copy(announced500 = true, announced100 = true, announcedNow = true)
+                                                    changed = true
+                                                }
+
+                                                // Если мы пролетели поворот (удалились от него, а он так и не был озвучен как "Now")
+                                                if (distToTurn > 100.0 && nextStep.announced100 && !nextStep.announcedNow) {
+                                                    updatedList[stepIndex] = nextStep.copy(announcedNow = true)
+                                                    changed = true
+                                                }
+
+                                                if (changed) navSteps = updatedList
                                             }
                                         }
                                         previousLocation = loc
@@ -503,14 +531,7 @@ fun MapScreen() {
                         }
                         mapView.overlays.add(traveledLine)
                     }
-                    if (closestUserIndex < nextCargoIndex) {
-                        val currentLine = Polyline(mapView).apply {
-                            setPoints(routePoints.subList(closestUserIndex, nextCargoIndex + 1))
-                            outlinePaint.color = android.graphics.Color.parseColor("#00FF00")
-                            outlinePaint.strokeWidth = 12f
-                        }
-                        mapView.overlays.add(currentLine)
-                    }
+                    // СНАЧАЛА РИСУЕМ ОРАНЖЕВУЮ (Она ляжет вниз)
                     if (nextCargoIndex < routePoints.size - 1) {
                         val futureLine = Polyline(mapView).apply {
                             setPoints(routePoints.subList(nextCargoIndex, routePoints.size))
@@ -518,6 +539,16 @@ fun MapScreen() {
                             outlinePaint.strokeWidth = 12f
                         }
                         mapView.overlays.add(futureLine)
+                    }
+
+                    // ПОТОМ РИСУЕМ ЗЕЛЕНУЮ (Она ляжет поверх оранжевой!)
+                    if (closestUserIndex < nextCargoIndex) {
+                        val currentLine = Polyline(mapView).apply {
+                            setPoints(routePoints.subList(closestUserIndex, nextCargoIndex + 1))
+                            outlinePaint.color = android.graphics.Color.parseColor("#00FF00")
+                            outlinePaint.strokeWidth = 12f
+                        }
+                        mapView.overlays.add(currentLine)
                     }
                     if (!hasZoomedToRoute) {
                         hasZoomedToRoute = true
@@ -981,11 +1012,20 @@ suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Di
                 val locArray = maneuver.getJSONArray("location")
                 val stepGeo = GeoPoint(locArray.getDouble(1), locArray.getDouble(0))
                 var instruction = ""
+                val type = maneuver.optString("type", "")
+
                 when (modifier) {
                     "right", "sharp right", "slight right" -> instruction = "поверните направо"
                     "left", "sharp left", "slight left" -> instruction = "поверните налево"
                     "uturn" -> instruction = "развернитесь"
+                    "straight" -> instruction = "продолжайте движение прямо"
                 }
+
+                // Если это конец дороги (Т-образный перекресток)
+                if (type == "end of road") {
+                    instruction = "на перекрестке $instruction"
+                }
+
                 if (instruction.isNotEmpty()) stepsList.add(RouteStep(stepGeo, instruction))
             }
         }
@@ -1031,6 +1071,12 @@ fun loadSectors(context: android.content.Context): List<CitySector> {
     val json = prefs.getString("city_sectors", null) ?: return emptyList()
     return try { Gson().fromJson(json, object : TypeToken<List<CitySector>>() {}.type) } catch (e: Exception) { emptyList() }
 }
+fun getPointAtAngle(center: GeoPoint, dist: Double, angle: Double): GeoPoint {
+    val rad = 111300.0
+    val dLat = (dist * Math.cos(Math.toRadians(angle))) / rad
+    val dLon = (dist * Math.sin(Math.toRadians(angle))) / (rad * Math.cos(Math.toRadians(center.latitude)))
+    return GeoPoint(center.latitude + dLat, center.longitude + dLon)
+}
 fun generateCityGrid(center: GeoPoint): List<CitySector> {
     val sectors = mutableListOf<CitySector>()
     var id = 0
@@ -1063,12 +1109,29 @@ fun saveVisitedPoints(context: android.content.Context, points: List<GeoPoint>) 
     val json = Gson().toJson(points.map { mapOf("lat" to it.latitude, "lon" to it.longitude) })
     context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putString("visited_points", json).apply()
 }
-fun getPointAtAngle(center: GeoPoint, dist: Double, angle: Double): GeoPoint {
-    val rad = 111300.0
-    val dLat = (dist * cos(Math.toRadians(angle))) / rad
-    val dLon = (dist * sin(Math.toRadians(angle))) / (rad * cos(Math.toRadians(center.latitude)))
-    return GeoPoint(center.latitude + dLat, center.longitude + dLon)
+
+// Умный расчет расстояния от точки до отрезка линии (чтобы не сбиваться на прямых дорогах)
+fun getDistanceToSegment(p: GeoPoint, a: GeoPoint, b: GeoPoint): Double {
+    val latToM = 111320.0
+    val lonToM = 111320.0 * Math.cos(Math.toRadians(p.latitude))
+
+    val px = p.longitude * lonToM
+    val py = p.latitude * latToM
+    val ax = a.longitude * lonToM
+    val ay = a.latitude * latToM
+    val bx = b.longitude * lonToM
+    val by = b.latitude * latToM
+
+    val l2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
+    if (l2 == 0.0) return p.distanceToAsDouble(a)
+
+    val t = Math.max(0.0, Math.min(1.0, ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2))
+    val projX = ax + t * (bx - ax)
+    val projY = ay + t * (by - ay)
+
+    return Math.sqrt((px - projX) * (px - projX) + (py - projY) * (py - projY))
 }
+
 fun loadVisitedPoints(context: android.content.Context): List<GeoPoint> {
     val json = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getString("visited_points", null) ?: return emptyList()
     return try {
