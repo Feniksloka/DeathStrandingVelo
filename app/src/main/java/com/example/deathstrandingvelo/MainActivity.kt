@@ -64,7 +64,7 @@ import kotlin.random.Random
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.ui.zIndex
 import androidx.activity.compose.BackHandler
-
+import androidx.compose.material.icons.filled.MyLocation
 // БЫЛО:
 // data class CargoTemplate(val name: String, val description: String, val weightKg: Double, val isFragile: Boolean, val baseXp: Int = 100)
 
@@ -1106,6 +1106,14 @@ fun MapScreen(onBack: () -> Unit) {
                         saveVisitedPoints(context, emptyList())
                         android.widget.Toast.makeText(context, "История очищена", android.widget.Toast.LENGTH_SHORT).show()
                     }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error), modifier = Modifier.fillMaxWidth()) { Text("Сбросить историю мест (500м)") }
+                    Button(
+                        onClick = {
+                            dbHelper.clearAllPendingCargo()
+                            android.widget.Toast.makeText(context, "Все грузы утилизированы", android.widget.Toast.LENGTH_SHORT).show()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Утилизировать все грузы (Склад и Велик)") }
                 }
             },
             confirmButton = { TextButton(onClick = { showSettingsDialog = false }) { Text("Закрыть") } }
@@ -1203,105 +1211,7 @@ fun sortCargosByNearest(start: GeoPoint, cargos: List<CargoItem>): List<CargoIte
     return sorted
 }
 
-@Composable
-fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
-    var warehouseItems by remember { mutableStateOf(dbHelper.getCargoByStatus("IN_WAREHOUSE")) }
-    var bikeItems by remember { mutableStateOf(dbHelper.getCargoByStatus("ON_BIKE")) }
 
-    val currentWeight = bikeItems.sumOf { it.weightKg }
-    val maxWeight = 50.0
-
-    val refreshData = {
-        warehouseItems = dbHelper.getCargoByStatus("IN_WAREHOUSE")
-        bikeItems = dbHelper.getCargoByStatus("ON_BIKE")
-    }
-
-    // ГРУППИРУЕМ ГРУЗЫ В СТАКИ (По имени)
-    val groupedWarehouse = warehouseItems.groupBy { it.name }
-    val groupedBike = bikeItems.groupBy { it.name }
-
-    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-
-            // ШАПКА
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("Багажник: $currentWeight / $maxWeight кг", style = MaterialTheme.typography.titleLarge)
-                IconButton(onClick = onClose) { Icon(Icons.Filled.ArrowBack, contentDescription = "Назад") }
-            }
-
-            val isOverweight = currentWeight > maxWeight * 0.9
-            LinearProgressIndicator(
-                progress = (currentWeight / maxWeight).toFloat().coerceIn(0f, 1f),
-                color = if (isOverweight) androidx.compose.ui.graphics.Color.Red else MaterialTheme.colorScheme.primary,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(8.dp)
-            )
-
-            // КНОПКИ УПРАВЛЕНИЯ
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { dbHelper.autoLoadBike(maxWeight); refreshData() }, modifier = Modifier.weight(1f)) {
-                    Text("Авто-загрузка", style = MaterialTheme.typography.bodySmall)
-                }
-                OutlinedButton(onClick = { dbHelper.unloadAllFromBike(); refreshData() }, modifier = Modifier.weight(1f)) {
-                    Text("Снять всё", style = MaterialTheme.typography.bodySmall)
-                }
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // СПИСОК НА ВЕЛОСИПЕДЕ (Занимает ровно половину оставшегося экрана)
-            Text("На велосипеде (Клик - снять 1 шт):", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-            LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                items(groupedBike.entries.toList()) { (name, items) ->
-                    val count = items.size
-                    val firstItem = items.first()
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
-                            dbHelper.updateCargoStatus(firstItem.id, "IN_WAREHOUSE") // Снимаем только 1 штуку из стака!
-                            refreshData()
-                        },
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-                    ) {
-                        Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Column {
-                                Text("$name x$count", style = MaterialTheme.typography.bodyLarge)
-                                Text("${firstItem.xpReward * count} XP", style = MaterialTheme.typography.bodySmall)
-                            }
-                            Text("${firstItem.weightKg * count} кг", style = MaterialTheme.typography.titleMedium)
-                        }
-                    }
-                }
-            }
-
-            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-
-            // СПИСОК НА СКЛАДЕ (Занимает вторую половину)
-            Text("На складе (Клик - взять 1 шт):", style = MaterialTheme.typography.titleMedium)
-            LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                items(groupedWarehouse.entries.toList()) { (name, items) ->
-                    val count = items.size
-                    val firstItem = items.first()
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
-                            if (currentWeight + firstItem.weightKg <= maxWeight) {
-                                dbHelper.updateCargoStatus(firstItem.id, "ON_BIKE") // Берем только 1 штуку!
-                                refreshData()
-                            }
-                        },
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-                    ) {
-                        Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Column {
-                                Text("$name x$count", style = MaterialTheme.typography.bodyLarge)
-                                Text(if (firstItem.isFragile) "Хрупкое!" else "Обычное", style = MaterialTheme.typography.bodySmall, color = if (firstItem.isFragile) androidx.compose.ui.graphics.Color.Red else androidx.compose.ui.graphics.Color.Gray)
-                            }
-                            Text("${firstItem.weightKg * count} кг", style = MaterialTheme.typography.titleMedium)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 
 // Умный рандом: выбирает груз на основе его шанса (spawnChance)
 fun getRandomCargoByChance(templates: List<CargoTemplate>): CargoTemplate {
@@ -1360,7 +1270,22 @@ fun AppNavigation() {
         )
     }
 }
+// Умный расчет примерного расстояния по прямой с коэффициентом кривизны дорог (1.3)
+fun calculateEstimatedRoute(start: GeoPoint, cargos: List<CargoItem>): Double {
+    if (cargos.isEmpty()) return 0.0
+    var dist = 0.0
+    var currentPos = start
+    val remaining = cargos.toMutableList()
 
+    while (remaining.isNotEmpty()) {
+        val nearest = remaining.minByOrNull { it.location.distanceToAsDouble(currentPos) }!!
+        dist += currentPos.distanceToAsDouble(nearest.location)
+        currentPos = nearest.location
+        remaining.remove(nearest)
+    }
+    dist += currentPos.distanceToAsDouble(start) // Возврат домой
+    return dist * 1.3 // Коэффициент извилистости дорог
+}
 @Composable
 fun MainHubScreen(
     onNavigateToMap: () -> Unit,
@@ -1444,6 +1369,122 @@ fun MainHubScreen(
 }
 
 @Composable
+fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
+    val context = LocalContext.current
+    var warehouseItems by remember { mutableStateOf(dbHelper.getCargoByStatus("IN_WAREHOUSE")) }
+    var bikeItems by remember { mutableStateOf(dbHelper.getCargoByStatus("ON_BIKE")) }
+
+    val currentWeight = bikeItems.sumOf { it.weightKg }
+    val maxWeight = 50.0
+
+    val refreshData = {
+        warehouseItems = dbHelper.getCargoByStatus("IN_WAREHOUSE")
+        bikeItems = dbHelper.getCargoByStatus("ON_BIKE")
+    }
+
+    val groupedWarehouse = warehouseItems.groupBy { it.name }
+    val groupedBike = bikeItems.groupBy { it.name }
+
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("Багажник: $currentWeight / $maxWeight кг", style = MaterialTheme.typography.titleLarge)
+                IconButton(onClick = onClose) { Icon(Icons.Filled.ArrowBack, contentDescription = "Назад") }
+            }
+
+            val isOverweight = currentWeight > maxWeight * 0.9
+            LinearProgressIndicator(
+                progress = (currentWeight / maxWeight).toFloat().coerceIn(0f, 1f),
+                color = if (isOverweight) androidx.compose.ui.graphics.Color.Red else MaterialTheme.colorScheme.primary,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(8.dp)
+            )
+// КНОПКИ УПРАВЛЕНИЯ
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        dbHelper.autoLoadBike(maxWeight, context)
+                        refreshData()
+                    },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Авто-загрузка", style = MaterialTheme.typography.bodySmall) }
+
+                OutlinedButton(
+                    onClick = {
+                        dbHelper.unloadAllFromBike()
+                        refreshData()
+                    },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Снять всё", style = MaterialTheme.typography.bodySmall) }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // НОВАЯ КНОПКА: УТИЛИЗАЦИЯ (СБРОС)
+            OutlinedButton(
+                onClick = {
+                    dbHelper.clearAllPendingCargo()
+                    refreshData()
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = androidx.compose.ui.graphics.Color.Red)
+            ) { Text("Утилизировать все грузы (Очистить базу)") }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("На велосипеде (Клик - снять 1 шт):", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+            LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                items(groupedBike.entries.toList()) { (name, items) ->
+                    val count = items.size
+                    val firstItem = items.first()
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
+                            dbHelper.updateCargoStatus(firstItem.id, "IN_WAREHOUSE")
+                            refreshData()
+                        },
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                    ) {
+                        Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Column {
+                                Text("$name x$count", style = MaterialTheme.typography.bodyLarge)
+                                Text("${firstItem.xpReward * count} XP", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Text("${firstItem.weightKg * count} кг", style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+                }
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+            Text("На складе (Клик - взять 1 шт):", style = MaterialTheme.typography.titleMedium)
+            LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                items(groupedWarehouse.entries.toList()) { (name, items) ->
+                    val count = items.size
+                    val firstItem = items.first()
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
+                            if (currentWeight + firstItem.weightKg <= maxWeight) {
+                                dbHelper.updateCargoStatus(firstItem.id, "ON_BIKE")
+                                refreshData()
+                            }
+                        },
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Column {
+                                Text("$name x$count", style = MaterialTheme.typography.bodyLarge)
+                                Text(if (firstItem.isFragile) "Хрупкое!" else "Обычное", style = MaterialTheme.typography.bodySmall, color = if (firstItem.isFragile) androidx.compose.ui.graphics.Color.Red else androidx.compose.ui.graphics.Color.Gray)
+                            }
+                            Text("${firstItem.weightKg * count} кг", style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun ContractsMapScreen(
     offeredContracts: List<CargoItem>, dbHelper: DatabaseHelper,
     onAccept: (CargoItem) -> Unit, onDecline: (CargoItem) -> Unit, onBack: () -> Unit
@@ -1453,11 +1494,28 @@ fun ContractsMapScreen(
     var selectedContract by remember { mutableStateOf<CargoItem?>(null) }
     var hasCentered by remember { mutableStateOf(false) }
 
-    // Считаем вес на велике в реальном времени
-    var bikeWeight by remember { mutableStateOf(0.0) }
-    LaunchedEffect(offeredContracts) {
-        bikeWeight = dbHelper.getCargoByStatus("ON_BIKE").sumOf { it.weightKg }
+    // МАГИЯ: Флаг для центрирования камеры по кнопке
+    var shouldCenterCamera by remember { mutableStateOf(false) }
+
+    val baseLocation = loadBaseLocation(context)
+
+    var warehouseCargos by remember { mutableStateOf(dbHelper.getCargoByStatus("IN_WAREHOUSE")) }
+    var bikeCargos by remember { mutableStateOf(dbHelper.getCargoByStatus("ON_BIKE")) }
+
+    var sessionAcceptedCargos by remember { mutableStateOf<List<CargoItem>>(emptyList()) }
+
+    val bikeWeight = bikeCargos.sumOf { it.weightKg }
+    val sessionWeight = sessionAcceptedCargos.sumOf { it.weightKg }
+    val totalPlannedWeight = bikeWeight + sessionWeight
+
+    val deliveryCargos = (bikeCargos + sessionAcceptedCargos).filter {
+        baseLocation == null || it.location.distanceToAsDouble(baseLocation) > 10.0
     }
+
+    val startPt = userPosition ?: baseLocation ?: GeoPoint(0.0, 0.0)
+    val estDistMeters = calculateEstimatedRoute(startPt, deliveryCargos)
+    val estDistKm = ((estDistMeters / 1000.0) * 10).roundToInt() / 10.0
+    val estTimeMins = ((estDistKm / 11.0) * 60.0).roundToInt()
 
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
@@ -1480,15 +1538,22 @@ fun ContractsMapScreen(
                 }
             },
             update = { mapView ->
+                // Первичное центрирование при открытии карты
                 if (userPosition != null && !hasCentered) {
                     hasCentered = true
                     mapView.controller.animateTo(userPosition)
                     mapView.controller.setZoom(13.5)
                 }
 
+                // ЦЕНТРИРОВАНИЕ ПО КНОПКЕ
+                if (shouldCenterCamera && userPosition != null) {
+                    shouldCenterCamera = false
+                    mapView.controller.animateTo(userPosition)
+                    mapView.controller.setZoom(14.5) // Приближаем чуть сильнее, чтобы было видно район
+                }
+
                 mapView.overlays.removeAll { it is Marker }
 
-                // Рисуем маркеры с расстоянием
                 offeredContracts.forEach { cargo ->
                     val distKm = if (userPosition != null) {
                         (userPosition!!.distanceToAsDouble(cargo.location) / 100.0).roundToInt() / 10.0
@@ -1510,23 +1575,41 @@ fun ContractsMapScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // ТОП ПАНЕЛЬ: ИНФОРМАЦИЯ О ВЕСЕ
+        // ТОП ПАНЕЛЬ: ИНФОРМАЦИЯ О ВЕСЕ И МАРШРУТЕ
         Card(
-            modifier = Modifier.align(Alignment.TopCenter).padding(16.dp).fillMaxWidth(0.9f),
+            modifier = Modifier.align(Alignment.TopCenter).padding(16.dp).fillMaxWidth(0.95f),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f))
         ) {
             Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Column {
                     Text("Доступно контрактов: ${offeredContracts.size}", style = MaterialTheme.typography.titleMedium)
-                    Text("Загрузка велика: $bikeWeight / 50.0 кг", color = if (bikeWeight > 45.0) androidx.compose.ui.graphics.Color.Red else MaterialTheme.colorScheme.primary)
+                    Text("План загрузки: $totalPlannedWeight / 50.0 кг", color = if (totalPlannedWeight > 45.0) androidx.compose.ui.graphics.Color.Red else MaterialTheme.colorScheme.primary)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text("План маршрута: $estDistKm км (~$estTimeMins мин)", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.secondary)
                 }
                 IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Назад") }
             }
         }
 
+        // НОВАЯ КНОПКА: ЦЕНТРИРОВАТЬ НА МНЕ
+        FloatingActionButton(
+            onClick = { shouldCenterCamera = true },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(16.dp),
+            containerColor = MaterialTheme.colorScheme.primaryContainer
+        ) {
+            Icon(Icons.Filled.MyLocation, contentDescription = "Где я")
+        }
+
         // ДИАЛОГ ПРИНЯТИЯ КОНТРАКТА
         if (selectedContract != null) {
             val cargo = selectedContract!!
+
+            val newEst = calculateEstimatedRoute(startPt, deliveryCargos + cargo)
+            val addedDistKm = (((newEst - estDistMeters) / 1000.0) * 10).roundToInt() / 10.0
+            val addedTimeMins = ((addedDistKm / 11.0) * 60.0).roundToInt()
+
             AlertDialog(
                 onDismissRequest = { selectedContract = null },
                 title = { Text(cargo.name) },
@@ -1540,14 +1623,23 @@ fun ContractsMapScreen(
                         Text("Награда: ${cargo.xpReward} XP", color = MaterialTheme.colorScheme.primary)
 
                         HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-                        Text("На велике: $bikeWeight / 50.0 кг", style = MaterialTheme.typography.bodySmall)
-                        if (bikeWeight + cargo.weightKg > 50.0) {
-                            Text("⚠️ ПЕРЕГРУЗ! Положите на склад.", color = androidx.compose.ui.graphics.Color.Red, style = MaterialTheme.typography.bodySmall)
+
+                        Text("Удлинит маршрут на: +$addedDistKm км (~$addedTimeMins мин)", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.secondary)
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        Text("Будет загружено: ${totalPlannedWeight + cargo.weightKg} / 50.0 кг", style = MaterialTheme.typography.bodySmall)
+                        if (totalPlannedWeight + cargo.weightKg > 50.0) {
+                            Text("⚠️ ПЕРЕГРУЗ! Вы не сможете увезти всё за один раз.", color = androidx.compose.ui.graphics.Color.Red, style = MaterialTheme.typography.bodySmall)
                         }
                     }
                 },
                 confirmButton = {
-                    Button(onClick = { onAccept(cargo); selectedContract = null }) { Text("Принять на склад") }
+                    Button(onClick = {
+                        onAccept(cargo)
+                        sessionAcceptedCargos = sessionAcceptedCargos + cargo
+                        warehouseCargos = dbHelper.getCargoByStatus("IN_WAREHOUSE")
+                        selectedContract = null
+                    }) { Text("Принять на склад") }
                 },
                 dismissButton = {
                     OutlinedButton(onClick = { onDecline(cargo); selectedContract = null }) { Text("Отказаться") }

@@ -119,18 +119,30 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
     }
 
     // АВТО-РАСПРЕДЕЛЕНИЕ: Забиваем велик под завязку!
-    fun autoLoadBike(maxWeight: Double) {
+    // АВТО-РАСПРЕДЕЛЕНИЕ: Забиваем велик под завязку (ТОЛЬКО ЗАКАЗАМИ!)
+    fun autoLoadBike(maxWeight: Double, context: Context) {
         val currentWeight = getBikeWeight()
         var available = maxWeight - currentWeight
         val warehouseItems = getCargoByStatus("IN_WAREHOUSE")
+        val baseLoc = loadBaseLocation(context) // Узнаем, где наша база
+
         for (item in warehouseItems) {
+            // ИГНОРИРУЕМ материалы, которые предназначены для базы (обратные грузы)
+            if (baseLoc != null && item.location.distanceToAsDouble(baseLoc) < 10.0) continue
+
             if (item.weightKg <= available) {
                 updateCargoStatus(item.id, "ON_BIKE")
                 available -= item.weightKg
             }
         }
     }
-
+    // Очистить склад и багажник (Утилизация старых контрактов)
+    fun clearAllPendingCargo() {
+        val db = this.writableDatabase
+        // Удаляем только те, что лежат на складе или на велике
+        db.delete("cargo_items", "status IN ('IN_WAREHOUSE', 'ON_BIKE')", null)
+        db.close()
+    }
     // Добавить груз СРАЗУ НА ВЕЛИК (Для обратных грузов на маршруте)
     fun addCargoToBike(item: CargoItem) {
         val db = this.writableDatabase
