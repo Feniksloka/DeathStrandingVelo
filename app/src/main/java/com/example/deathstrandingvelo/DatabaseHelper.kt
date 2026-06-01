@@ -105,4 +105,46 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
         db.delete("cargo_items", "status = ?", arrayOf("DELIVERED"))
         db.close()
     }
+
+    // Узнать текущий вес на велосипеде
+    @SuppressLint("Range")
+    fun getBikeWeight(): Double {
+        val db = this.readableDatabase
+        val cursor = db.rawQuery("SELECT SUM(weight) FROM cargo_items WHERE status = 'ON_BIKE'", null)
+        var weight = 0.0
+        if (cursor.moveToFirst()) weight = cursor.getDouble(0)
+        cursor.close()
+        db.close()
+        return weight
+    }
+
+    // АВТО-РАСПРЕДЕЛЕНИЕ: Забиваем велик под завязку!
+    fun autoLoadBike(maxWeight: Double) {
+        val currentWeight = getBikeWeight()
+        var available = maxWeight - currentWeight
+        val warehouseItems = getCargoByStatus("IN_WAREHOUSE")
+        for (item in warehouseItems) {
+            if (item.weightKg <= available) {
+                updateCargoStatus(item.id, "ON_BIKE")
+                available -= item.weightKg
+            }
+        }
+    }
+
+    // Добавить груз СРАЗУ НА ВЕЛИК (Для обратных грузов на маршруте)
+    fun addCargoToBike(item: CargoItem) {
+        val db = this.writableDatabase
+        val values = ContentValues().apply {
+            put("name", item.name)
+            put("description", item.description)
+            put("weight", item.weightKg)
+            put("is_fragile", if (item.isFragile) 1 else 0)
+            put("xp_reward", item.xpReward)
+            put("status", "ON_BIKE") // Сразу на багажник!
+            put("lat", item.location.latitude)
+            put("lon", item.location.longitude)
+        }
+        db.insert("cargo_items", null, values)
+        db.close()
+    }
 }

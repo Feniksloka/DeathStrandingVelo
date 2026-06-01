@@ -121,6 +121,40 @@ class MainActivity : ComponentActivity() {
 @SuppressLint("MissingPermission")
 @Composable
 fun MapScreen(onBack: () -> Unit) {
+    // 1. СНАЧАЛА ОБЪЯВЛЯЕМ КОНТЕКСТ И КОРУТИНЫ! (Это самое важное)
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+
+    // 2. ТЕПЕРЬ КОНТЕКСТ СУЩЕСТВУЕТ, И МЫ МОЖЕМ ЕГО ИСПОЛЬЗОВАТЬ:
+    val dbHelper = remember { DatabaseHelper(context) }
+    var baseLocation by remember { mutableStateOf(loadBaseLocation(context)) }
+
+    var bikeCargos by remember { mutableStateOf(dbHelper.getCargoByStatus("ON_BIKE")) }
+    var cargoList by remember { mutableStateOf(bikeCargos) } // Карта рисует то, что на велике!
+
+    // Обновляем маркеры каждый раз, когда возвращаемся на карту из Склада
+    LaunchedEffect(Unit) {
+        bikeCargos = dbHelper.getCargoByStatus("ON_BIKE")
+        cargoList = bikeCargos
+    }
+
+    val refreshBikeCargos = {
+        bikeCargos = dbHelper.getCargoByStatus("ON_BIKE")
+        cargoList = bikeCargos
+    }
+
+    // 3. Читаем базу грузов один раз при запуске
+    val cargoTemplates by remember { mutableStateOf(
+        try {
+            val jsonString = context.assets.open("cargo_db.json").bufferedReader().use { it.readText() }
+            val templateType = object : TypeToken<List<CargoTemplate>>() {}.type
+            Gson().fromJson<List<CargoTemplate>>(jsonString, templateType)
+        } catch (e: Exception) {
+            listOf(CargoTemplate("Аварийный груз", "База данных не найдена.", 5.0, false, 100))
+        }
+    )}
+
+    var playerXp by remember { mutableStateOf(loadPlayerXp(context)) }
 
     // --- ПЕРЕМЕННЫЕ ДЛЯ СЛУЧАЙНЫХ СОБЫТИЙ ---
     var distanceSinceLastEventCheck by remember { mutableStateOf(0.0) }
@@ -128,14 +162,11 @@ fun MapScreen(onBack: () -> Unit) {
     var pendingSideQuestLocation by remember { mutableStateOf<GeoPoint?>(null) }
     var showSideQuestDialog by remember { mutableStateOf(false) }
 
-    val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
     val audioManager = remember { context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager }
     val focusRequest = remember {
         AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
             .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()).build()
     }
-    var playerXp by remember { mutableStateOf(loadPlayerXp(context)) }
 
     // Загружаем уровни из JSON или генерируем идеальную кривую по умолчанию
     val levelsDb by remember { mutableStateOf(
@@ -497,11 +528,52 @@ fun MapScreen(onBack: () -> Unit) {
                                             }
                                         }
                                         previousLocation = loc
-                                        val nextCargo = cargoList.firstOrNull { it.status == CargoStatus.PENDING }
-                                        if (nextCargo != null) {
-                                            if (currentGeo.distanceToAsDouble(nextCargo.location) <= 25.0) {
-                                                processCargo(nextCargo.id, CargoStatus.COLLECTED)
+                                        // --- ГЕНИАЛЬНАЯ СИСТЕМА ДОСТАВКИ И ПОДБОРА ---
+                                        var cargoDelivered = false
+
+                                        // 1. Проверяем доставку на БАЗУ (Радиус 100 метров)
+                                        if (baseLocation != null && currentGeo.distanceToAsDouble(baseLocation!!) <= 100.0) {
+                                            val cargosForBase = bikeCargos.filter { it.location.distanceToAsDouble(baseLocation!!) < 10.0 }
+                                            if (cargosForBase.isNotEmpty()) {
+                                                cargosForBase.forEach {
+                                                    dbHelper.updateCargoStatus(it.id, "DELIVERED")
+                                                    playerXp += it.xpReward
+                                                }
+                                                tts.speak("Возврат на базу. Доставлено грузов: ${cargosForBase.size}.", TextToSpeech.QUEUE_ADD, null, "nav")
+                                                cargoDelivered = true
                                             }
+                                        }
+
+                                        // 2. Проверяем доставку на ТОЧКИ (Радиус 25 метров)
+                                        bikeCargos.forEach { cargo ->
+                                            if (currentGeo.distanceToAsDouble(cargo.location) <= 25.0 && cargo.location.distanceToAsDouble(baseLocation ?: GeoPoint(0.0,0.0)) > 10.0) {
+
+                                                // ДОСТАВЛЯЕМ ГРУЗ
+                                                dbHelper.updateCargoStatus(cargo.id, "DELIVERED")
+                                                playerXp += cargo.xpReward
+                                                tts.speak("Груз доставлен. Получено ${cargo.xpReward} опыта.", TextToSpeech.QUEUE_ADD, null, "nav")
+                                                cargoDelivered = true
+
+                                                // БЕРЕМ ОБРАТНЫЙ ГРУЗ ИЗ БАЗЫ JSON (Если есть место и установлена База)
+                                                val currentWeight = dbHelper.getBikeWeight()
+                                                val template = cargoTemplates.random() // Берем случайный груз из cargo_db.json!
+
+                                                if (baseLocation != null && currentWeight + template.weightKg <= 50.0) {
+                                                    val returnCargo = CargoItem(
+                                                        id = 0, name = template.name, description = template.description,
+                                                        weightKg = template.weightKg, isFragile = template.isFragile, location = baseLocation!!,
+                                                        xpReward = template.baseXp + Random.nextInt(50, 150), status = CargoStatus.PENDING
+                                                    )
+                                                    dbHelper.addCargoToBike(returnCargo)
+                                                    tts.speak("Взят попутный груз до базы: ${template.name}. Вес: ${template.weightKg} килограмм.", TextToSpeech.QUEUE_ADD, null, "nav")
+                                                }
+                                            }
+                                        }
+
+                                        if (cargoDelivered) {
+                                            savePlayerXp(context, playerXp)
+                                            updateNotification(playerXp)
+                                            refreshBikeCargos() // Обновляем маркеры на карте!
                                         }
                                     }
                                 }
@@ -531,7 +603,16 @@ fun MapScreen(onBack: () -> Unit) {
                 }
 
                 mapView.overlays.removeAll { it is Marker || it is Polyline || it is Polygon }
-
+// --- ОТРИСОВКА БАЗЫ (СИНИЙ КРУГ 100м) ---
+                if (baseLocation != null) {
+                    val baseCircle = Polygon(mapView).apply {
+                        points = Polygon.pointsAsCircle(baseLocation, 100.0) // Радиус 100 метров
+                        fillPaint.color = android.graphics.Color.parseColor("#440088FF") // Полупрозрачный синий
+                        outlinePaint.color = android.graphics.Color.parseColor("#0088FF") // Яркая синяя граница
+                        outlinePaint.strokeWidth = 5f
+                    }
+                    mapView.overlays.add(baseCircle)
+                }
                 // 3. ОТРИСОВКА СЕТКИ ГОРОДА (ШЕСТИУГОЛЬНИКИ)
                 if (isGridEditMode || !isRouteBuilt) {
                     citySectors.forEach { sector ->
@@ -732,22 +813,25 @@ fun MapScreen(onBack: () -> Unit) {
                                         citySectors = updatedSectors
                                         saveSectors(context, updatedSectors)
 
-                                        val allTemplates: List<CargoTemplate> = try {
-                                            val jsonString = context.assets.open("cargo_db.json").bufferedReader().use { it.readText() }
-                                            val templateType = object : TypeToken<List<CargoTemplate>>() {}.type
-                                            Gson().fromJson(jsonString, templateType)
-                                        } catch (e: Exception) {
-                                            listOf(CargoTemplate("Аварийный груз", "База данных не найдена.", 5.0, false), CargoTemplate("Утерянный контейнер", "Резервная генерация.", 2.5, true))
+                                        // БЕРЕМ ГРУЗЫ ИЗ ПАМЯТИ (Мы их уже прочитали при запуске!)
+                                        val shuffledTemplates = allTemplates.shuffled()
+                                        bestPoints.forEachIndexed { index, pt ->
+                                            val template = if (shuffledTemplates.isNotEmpty()) shuffledTemplates[index % shuffledTemplates.size] else CargoTemplate("Пусто", "Пусто", 0.0, false)
+                                            val xpReward = template.baseXp + (if (template.isFragile) 50 else 0) + Random.nextInt(10, 50)
+
+                                            // СОЗДАЕМ ГРУЗ И КЛАДЕМ ЕГО НА СКЛАД!
+                                            val newItem = CargoItem(0, template.name, template.description, template.weightKg, template.isFragile, pt, xpReward, CargoStatus.PENDING)
+                                            dbHelper.addCargoToWarehouse(newItem)
                                         }
 
-                                        val shuffledTemplates = allTemplates.shuffled()
-                                        cargoList = bestPoints.mapIndexed { index, pt ->
-                                            val template = if (shuffledTemplates.isNotEmpty()) shuffledTemplates[index % shuffledTemplates.size] else CargoTemplate("Пусто", "Пусто", 0.0, false)
-                                            // Даем базовый опыт + бонус за хрупкость + случайный бонус от 10 до 50 XP
-                                            val xpReward = template.baseXp + (if (template.isFragile) 50 else 0) + Random.nextInt(10, 50)
-                                            CargoItem(index + 1, template.name, template.description, template.weightKg, template.isFragile, pt, xpReward)   }
+                                        // Очищаем карту, так как велик пока пустой
+                                        cargoList = emptyList()
+                                        bikeCargos = emptyList()
+
+                                        android.widget.Toast.makeText(context, "Грузы на складе! Загрузите велосипед.", android.widget.Toast.LENGTH_LONG).show()
 
                                         routePoints = route
+
                                         navSteps = generatedSteps
                                         totalDistanceMeters = totalDistance
                                         distanceTraveledMeters = 0.0
@@ -916,6 +1000,45 @@ fun MapScreen(onBack: () -> Unit) {
             text = {
                 val scrollState = rememberScrollState()
                 Column(modifier = Modifier.verticalScroll(scrollState)) {
+
+                    // --- БАЗА (ДОМАШНИЙ ТЕРМИНАЛ) ---
+                    Text("Узел связи (База)", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Button(
+                        onClick = {
+                            if (userPosition != null) {
+                                baseLocation = userPosition
+                                saveBaseLocation(context, userPosition!!)
+                                android.widget.Toast.makeText(context, "Домашний терминал установлен!", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF007AFF))
+                    ) { Text("Установить Базу на моем месте") }
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            val activeSectors = citySectors.filter { it.isActive }
+                            if (activeSectors.isNotEmpty()) {
+                                for (i in 1..10) {
+                                    val template = cargoTemplates.random()
+                                    val randomSector = activeSectors.random()
+                                    val xpReward = template.baseXp + (if (template.isFragile) 50 else 0) + Random.nextInt(10, 50)
+
+                                    val newCargo = CargoItem(0, template.name, template.description, template.weightKg, template.isFragile, randomSector.center, xpReward, CargoStatus.PENDING)
+                                    dbHelper.addCargoToWarehouse(newCargo)
+                                }
+                                android.widget.Toast.makeText(context, "10 грузов доставлено на склад!", android.widget.Toast.LENGTH_SHORT).show()
+                            } else {
+                                android.widget.Toast.makeText(context, "Сначала создайте сетку!", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF4CAF50))
+                    ) { Text("Завезти 10 грузов на склад") }
+
                     Text("Голосовой ассистент", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
                     Spacer(modifier = Modifier.height(4.dp))
                     Button(onClick = {
@@ -939,9 +1062,7 @@ fun MapScreen(onBack: () -> Unit) {
                     if (availableVoices.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(8.dp))
                         ExposedDropdownMenuBox(expanded = isVoiceDropdownExpanded, onExpandedChange = { isVoiceDropdownExpanded = !isVoiceDropdownExpanded }) {
-                            OutlinedTextField(value = selectedVoiceName, onValueChange = {}, readOnly = true, label = { Text("Выберите голос") }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = isVoiceDropdownExpanded) }, modifier = Modifier
-                                .menuAnchor()
-                                .fillMaxWidth())
+                            OutlinedTextField(value = selectedVoiceName, onValueChange = {}, readOnly = true, label = { Text("Выберите голос") }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = isVoiceDropdownExpanded) }, modifier = Modifier.menuAnchor().fillMaxWidth())
                             ExposedDropdownMenu(expanded = isVoiceDropdownExpanded, onDismissRequest = { isVoiceDropdownExpanded = false }) {
                                 availableVoices.forEachIndexed { index, voice ->
                                     DropdownMenuItem(text = { Text("Голос ${index + 1} (${voice.name})") }, onClick = {
@@ -988,6 +1109,7 @@ fun MapScreen(onBack: () -> Unit) {
             confirmButton = { TextButton(onClick = { showSettingsDialog = false }) { Text("Закрыть") } }
         )
     }
+
     // ДИАЛОГ: Случайное событие (Потерянный груз)
     if (showSideQuestDialog && pendingSideQuestLocation != null) {
         AlertDialog(
@@ -1096,29 +1218,16 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(8.dp)
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
+            // КНОПКА АВТО-РАСПРЕДЕЛЕНИЯ
+            Button(
+                onClick = {
+                    dbHelper.autoLoadBike(maxWeight)
+                    refreshData()
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Авто-распределение грузов") }
 
-            // СПИСОК ГРУЗОВ НА ВЕЛОСИПЕДЕ
-            Text("На велосипеде (Нажмите, чтобы выложить):", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-            LazyColumn(modifier = Modifier.weight(1f)) {
-                items(bikeItems) { item ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
-                            dbHelper.updateCargoStatus(item.id, "IN_WAREHOUSE")
-                            refreshData()
-                        },
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-                    ) {
-                        Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Column {
-                                Text(item.name, style = MaterialTheme.typography.bodyLarge)
-                                Text("${item.xpReward} XP", style = MaterialTheme.typography.bodySmall)
-                            }
-                            Text("${item.weightKg} кг", style = MaterialTheme.typography.titleMedium)
-                        }
-                    }
-                }
-            }
+            Spacer(modifier = Modifier.height(16.dp))
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
@@ -1574,7 +1683,17 @@ fun savePlayerXp(context: android.content.Context, xp: Int) {
 fun loadPlayerXp(context: android.content.Context): Int {
     return context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getInt("player_xp", 0)
 }
+fun saveBaseLocation(context: android.content.Context, geoPoint: GeoPoint) {
+    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
+    prefs.edit().putString("base_lat", geoPoint.latitude.toString()).putString("base_lon", geoPoint.longitude.toString()).apply()
+}
 
+fun loadBaseLocation(context: android.content.Context): GeoPoint? {
+    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
+    val lat = prefs.getString("base_lat", null) ?: return null
+    val lon = prefs.getString("base_lon", null) ?: return null
+    return GeoPoint(lat.toDouble(), lon.toDouble())
+}
 class NavService : android.app.Service() {
     override fun onBind(intent: android.content.Intent?): android.os.IBinder? = null
 
