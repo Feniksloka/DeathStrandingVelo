@@ -61,8 +61,9 @@ import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.random.Random
-
-
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.ui.zIndex
+import androidx.activity.compose.BackHandler
 data class CargoTemplate(val name: String, val description: String, val weightKg: Double, val isFragile: Boolean, val baseXp: Int = 100)
 data class CargoItem(val id: Int, val name: String, val description: String, val weightKg: Double, val isFragile: Boolean, val location: GeoPoint, val xpReward: Int, var status: CargoStatus = CargoStatus.PENDING)
 
@@ -97,7 +98,7 @@ class MainActivity : ComponentActivity() {
                     }
                     val locationPermissionsState = rememberMultiplePermissionsState(perms)
                     if (locationPermissionsState.allPermissionsGranted) {
-                        MapScreen()
+                        AppNavigation() // <--- ИЗМЕНИЛИ ЭТУ СТРОЧКУ
                     } else {
                         Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                             Text("Для навигатора нужны GPS и Уведомления.")
@@ -119,7 +120,7 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @SuppressLint("MissingPermission")
 @Composable
-fun MapScreen() {
+fun MapScreen(onBack: () -> Unit) {
 
     // --- ПЕРЕМЕННЫЕ ДЛЯ СЛУЧАЙНЫХ СОБЫТИЙ ---
     var distanceSinceLastEventCheck by remember { mutableStateOf(0.0) }
@@ -284,6 +285,16 @@ fun MapScreen() {
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
+        if (!isRouteBuilt) {
+            FloatingActionButton(
+                onClick = onBack,
+                modifier = Modifier.align(Alignment.TopStart).padding(16.dp).zIndex(10f),
+                containerColor = MaterialTheme.colorScheme.surface
+            ) {
+                Icon(Icons.Filled.ArrowBack, contentDescription = "На базу")
+            }
+        }
+
         AndroidView(
             factory = { ctx ->
                 MapView(ctx).apply {
@@ -1049,6 +1060,177 @@ fun MapScreen() {
     }
     if (ttsDiagText.isNotEmpty()) {
         AlertDialog(onDismissRequest = { ttsDiagText = "" }, title = { Text("Вскрытие показало:") }, text = { Text(ttsDiagText) }, confirmButton = { Button(onClick = { ttsDiagText = "" }) { Text("Закрыть") } })
+    }
+}
+
+@Composable
+fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
+    // Состояния списков грузов
+    var warehouseItems by remember { mutableStateOf(dbHelper.getCargoByStatus("IN_WAREHOUSE")) }
+    var bikeItems by remember { mutableStateOf(dbHelper.getCargoByStatus("ON_BIKE")) }
+
+    val currentWeight = bikeItems.sumOf { it.weightKg }
+    val maxWeight = 50.0 // Лимит велосипеда
+
+    // Функция для обновления списков после клика
+    val refreshData = {
+        warehouseItems = dbHelper.getCargoByStatus("IN_WAREHOUSE")
+        bikeItems = dbHelper.getCargoByStatus("ON_BIKE")
+    }
+
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            // ШАПКА: ИНФОРМАЦИЯ О ВЕСЕ
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("Багажник: $currentWeight / $maxWeight кг", style = MaterialTheme.typography.titleLarge)
+                IconButton(onClick = onClose) {
+                    Icon(Icons.Filled.ArrowBack, contentDescription = "Назад")
+                }
+            }
+
+            // ПОЛОСКА ПЕРЕГРУЗА
+            val isOverweight = currentWeight > maxWeight * 0.9
+            LinearProgressIndicator(
+                progress = (currentWeight / maxWeight).toFloat().coerceIn(0f, 1f),
+                color = if (isOverweight) androidx.compose.ui.graphics.Color.Red else MaterialTheme.colorScheme.primary,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(8.dp)
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // СПИСОК ГРУЗОВ НА ВЕЛОСИПЕДЕ
+            Text("На велосипеде (Нажмите, чтобы выложить):", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                items(bikeItems) { item ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
+                            dbHelper.updateCargoStatus(item.id, "IN_WAREHOUSE")
+                            refreshData()
+                        },
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                    ) {
+                        Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Column {
+                                Text(item.name, style = MaterialTheme.typography.bodyLarge)
+                                Text("${item.xpReward} XP", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Text("${item.weightKg} кг", style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+                }
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+            // СПИСОК ГРУЗОВ НА СКЛАДЕ
+            Text("На складе (Нажмите, чтобы взять):", style = MaterialTheme.typography.titleMedium)
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                items(warehouseItems) { item ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
+                            if (currentWeight + item.weightKg <= maxWeight) {
+                                dbHelper.updateCargoStatus(item.id, "ON_BIKE")
+                                refreshData()
+                            }
+                        },
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Column {
+                                Text(item.name, style = MaterialTheme.typography.bodyLarge)
+                                Text(if (item.isFragile) "Хрупкое!" else "Обычное", style = MaterialTheme.typography.bodySmall, color = if (item.isFragile) androidx.compose.ui.graphics.Color.Red else androidx.compose.ui.graphics.Color.Gray)
+                            }
+                            Text("${item.weightKg} кг", style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum class ScreenState { HUB, MAP, WAREHOUSE }
+
+@Composable
+fun AppNavigation() {
+    var currentScreen by remember { mutableStateOf(ScreenState.HUB) }
+    val context = LocalContext.current
+    val dbHelper = remember { DatabaseHelper(context) }
+
+    // МАГИЯ: Перехватываем системную кнопку "Назад" (или свайп)
+    // Если мы НЕ в главном меню, кнопка "Назад" просто вернет нас в Хаб!
+    BackHandler(enabled = currentScreen != ScreenState.HUB) {
+        currentScreen = ScreenState.HUB
+    }
+
+    when (currentScreen) {
+        ScreenState.HUB -> MainHubScreen(
+            onNavigateToMap = { currentScreen = ScreenState.MAP },
+            onNavigateToWarehouse = { currentScreen = ScreenState.WAREHOUSE }
+        )
+        ScreenState.MAP -> MapScreen(
+            onBack = { currentScreen = ScreenState.HUB }
+        )
+        ScreenState.WAREHOUSE -> WarehouseScreen(
+            dbHelper = dbHelper,
+            onClose = { currentScreen = ScreenState.HUB }
+        )
+    }
+}
+@Composable
+fun MainHubScreen(onNavigateToMap: () -> Unit, onNavigateToWarehouse: () -> Unit) {
+    val context = LocalContext.current
+    val playerXp = loadPlayerXp(context)
+
+    // Простая генерация уровня для меню
+    val level = if (playerXp == 0) 0 else Math.floor(Math.sqrt((playerXp / 50).toDouble())).toInt()
+    val title = when(level) {
+        0 -> "Новичок"
+        in 1..9 -> "Младший курьер"
+        in 10..19 -> "Специалист доставки"
+        in 20..29 -> "Элитный курьер"
+        else -> "Мастер курьер"
+    }
+
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text("УЗЕЛ РАСПРЕДЕЛЕНИЯ", style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.primary)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                Column(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("⭐ $title $level", style = MaterialTheme.typography.titleLarge)
+                    Text("Опыт: $playerXp XP", style = MaterialTheme.typography.bodyMedium)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Очки навыков: 0 (В разработке)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            Button(onClick = onNavigateToMap, modifier = Modifier.fillMaxWidth().height(60.dp)) {
+                Text("Терминал доставки (Карта)", style = MaterialTheme.typography.titleMedium)
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(onClick = onNavigateToWarehouse, modifier = Modifier.fillMaxWidth().height(60.dp), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)) {
+                Text("Личное хранилище (Склад)", style = MaterialTheme.typography.titleMedium)
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+
+            OutlinedButton(onClick = { /* TODO */ }, modifier = Modifier.fillMaxWidth().height(60.dp)) {
+                Text("Гараж (В разработке)", style = MaterialTheme.typography.titleMedium)
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+
+            OutlinedButton(onClick = { /* TODO */ }, modifier = Modifier.fillMaxWidth().height(60.dp)) {
+                Text("Навыки (В разработке)", style = MaterialTheme.typography.titleMedium)
+            }
+        }
     }
 }
 
