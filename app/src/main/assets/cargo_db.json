@@ -1,16 +1,20 @@
 [
   {
-      "name": "Запчасти для терминала",
-      "description": "Тяжелые металлические детали. Не боятся ударов.",
-      "weightKg": 25.0,
-      "isFragile": false,
-      "baseXp": 150
+    "name": "Металл (Высокая плотность)",
+    "description": "Тяжелые материалы для постройки мостов.",
+    "weightKg": 25.0,
+    "isFragile": false,
+    "baseXp": 150,
+    "category": "Материалы",
+    "spawnChance": 80
   },
   {
-      "name": "Медикаменты",
-      "description": "Срочный груз. Требует аккуратности.",
-      "weightKg": 5.0,
-      "isFragile": true,
-      "baseXp": 250
+    "name": "Криптобиоты",
+    "description": "Медикаменты для восстановления крови.",
+    "weightKg": 2.0,
+    "isFragile": true,
+    "baseXp": 300,
+    "category": "Расходники",
+    "spawnChance": 20
   }
 ]

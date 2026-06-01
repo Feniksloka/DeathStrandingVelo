@@ -147,4 +147,11 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
         db.insert("cargo_items", null, values)
         db.close()
     }
+    // Снять все грузы с велосипеда обратно на склад
+    fun unloadAllFromBike() {
+        val db = this.writableDatabase
+        val values = ContentValues().apply { put("status", "IN_WAREHOUSE") }
+        db.update("cargo_items", values, "status = ?", arrayOf("ON_BIKE"))
+        db.close()
+    }
 }
