@@ -120,6 +120,13 @@ class MainActivity : ComponentActivity() {
 @SuppressLint("MissingPermission")
 @Composable
 fun MapScreen() {
+
+    // --- ПЕРЕМЕННЫЕ ДЛЯ СЛУЧАЙНЫХ СОБЫТИЙ ---
+    var distanceSinceLastEventCheck by remember { mutableStateOf(0.0) }
+    var currentEventChance by remember { mutableStateOf(10) } // Стартовый шанс 10%
+    var pendingSideQuestLocation by remember { mutableStateOf<GeoPoint?>(null) }
+    var showSideQuestDialog by remember { mutableStateOf(false) }
+
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val audioManager = remember { context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager }
@@ -400,6 +407,27 @@ fun MapScreen() {
                                     if (isRouteBuilt) {
                                         if (previousLocation != null) {
                                             distanceTraveledMeters += previousLocation!!.distanceTo(loc)
+                                            // --- ГЕНЕРАТОР СЛУЧАЙНЫХ СОБЫТИЙ ---
+                                            val distStep = previousLocation!!.distanceTo(loc).toDouble()
+                                            distanceSinceLastEventCheck += distStep
+
+                                            // Проверяем каждый 1 километр
+                                            if (distanceSinceLastEventCheck >= 1000.0 && pendingSideQuestLocation == null) {
+                                                distanceSinceLastEventCheck = 0.0
+                                                val roll = Random.nextInt(1, 101)
+
+                                                if (roll <= currentEventChance) {
+                                                    // СОБЫТИЕ СРАБОТАЛО!
+                                                    currentEventChance = 10 // Сбрасываем шанс
+                                                    // Спавним точку в радиусе от 1 до 3 км
+                                                    pendingSideQuestLocation = getPointAtAngle(currentGeo, Random.nextDouble(1000.0, 3000.0), Random.nextDouble(0.0, 360.0))
+                                                    showSideQuestDialog = true
+                                                    tts.speak("Внимание. Обнаружен неизвестный сигнал. Проверьте терминал.", TextToSpeech.QUEUE_ADD, null, "quest")
+                                                } else {
+                                                    // Не повезло - увеличиваем шанс на 1% для следующего километра
+                                                    currentEventChance += 1
+                                                }
+                                            }
                                             // 1. ПРОВЕРКА ОТКЛОНЕНИЯ ОТ МАРШРУТА (Умная)
                                             var minDistanceToLine = Double.MAX_VALUE
                                             if (routePoints.size > 1) {
@@ -949,7 +977,76 @@ fun MapScreen() {
             confirmButton = { TextButton(onClick = { showSettingsDialog = false }) { Text("Закрыть") } }
         )
     }
+    // ДИАЛОГ: Случайное событие (Потерянный груз)
+    if (showSideQuestDialog && pendingSideQuestLocation != null) {
+        AlertDialog(
+            onDismissRequest = { /* Блокируем закрытие по клику вне окна */ },
+            title = { Text("⚠️ Неизвестный сигнал") },
+            text = { Text("Датчики засекли утерянный груз в радиусе 3 км. Отклониться от курса и забрать?") },
+            confirmButton = {
+                Button(onClick = {
+                    showSideQuestDialog = false
+                    isLoading = true
 
+                    coroutineScope.launch {
+                        val currentPos = userPosition ?: return@launch
+                        val homePos = routePoints.lastOrNull() ?: currentPos
+
+                        // Собираем оставшиеся грузы
+                        val pendingCargos = cargoList.filter { it.status == CargoStatus.PENDING }
+
+                        // Строим новые точки: Мы -> Побочный квест -> Оставшиеся грузы -> Дом
+                        val waypoints = mutableListOf<GeoPoint>()
+                        waypoints.add(currentPos)
+                        waypoints.add(pendingSideQuestLocation!!)
+                        waypoints.addAll(pendingCargos.map { it.location })
+                        if (waypoints.last() != homePos) waypoints.add(homePos)
+
+                        // Запрашиваем новый маршрут у сервера
+                        val newRes = fetchOSRMRoute(waypoints)
+
+                        if (newRes != null) {
+                            // Создаем новый груз
+                            val newCargoId = (cargoList.maxOfOrNull { it.id } ?: 0) + 1
+                            val sideQuestCargo = CargoItem(
+                                id = newCargoId,
+                                name = "Утерянный груз (SOS)",
+                                description = "Случайная находка. Содержимое неизвестно.",
+                                weightKg = Random.nextDouble(2.0, 15.0).roundToInt().toDouble(),
+                                isFragile = Random.nextBoolean(),
+                                location = pendingSideQuestLocation!!,
+                                xpReward = Random.nextInt(300, 800) // За побочки дают много опыта!
+                            )
+
+                            // Вставляем новый груз ПЕРВЫМ в список ожидающих (чтобы зеленая линия вела к нему)
+                            val collected = cargoList.filter { it.status != CargoStatus.PENDING }
+                            cargoList = collected + listOf(sideQuestCargo) + pendingCargos
+
+                            // Обновляем навигатор
+                            routePoints = newRes.path
+                            navSteps = newRes.steps
+
+                            // Корректируем общую дистанцию (пройденное + то, что осталось проехать)
+                            totalDistanceMeters = distanceTraveledMeters + newRes.distanceMeters
+
+                            tts.speak("Маршрут перестроен. Следуйте к новой цели.", TextToSpeech.QUEUE_FLUSH, null, "nav")
+                        } else {
+                            android.widget.Toast.makeText(context, "Не удалось проложить маршрут к сигналу", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                        pendingSideQuestLocation = null
+                        isLoading = false
+                    }
+                }) { Text("Принять") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = {
+                    showSideQuestDialog = false
+                    pendingSideQuestLocation = null
+                    tts.speak("Сигнал проигнорирован. Возвращаюсь к текущему маршруту.", TextToSpeech.QUEUE_FLUSH, null, "nav")
+                }) { Text("Игнорировать") }
+            }
+        )
+    }
     if (ttsDiagText.isNotEmpty()) {
         AlertDialog(onDismissRequest = { ttsDiagText = "" }, title = { Text("Вскрытие показало:") }, text = { Text(ttsDiagText) }, confirmButton = { Button(onClick = { ttsDiagText = "" }) { Text("Закрыть") } })
     }
