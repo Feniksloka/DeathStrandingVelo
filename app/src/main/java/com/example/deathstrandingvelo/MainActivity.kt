@@ -100,7 +100,8 @@ data class LevelTemplate(val level: Int, val title: String, val requiredXp: Int)
 data class BikeUpgrade(val level: Int, val name: String, val maxWeightKg: Double, val costMoney: Int)
 enum class CargoStatus { PENDING, COLLECTED, CANCELED }
 data class CitySector(val id: Int, val center: GeoPoint, var isActive: Boolean = true, var visitCount: Int = 0)
-
+data class Infrastructure(val id: Int, val type: String, val location: GeoPoint)
+data class RecipeTemplate(val id: String, val name: String, val description: String, val weightKg: Double, val costMoney: Int)
 data class RouteStep(
     val location: GeoPoint,
     val instruction: String,
@@ -155,10 +156,11 @@ fun MapScreen(onBack: () -> Unit) {
 
     var bikeCargos by remember { mutableStateOf(dbHelper.getCargoByStatus("ON_BIKE")) }
     var cargoList by remember { mutableStateOf(bikeCargos) }
-
+    var infrastructures by remember { mutableStateOf(dbHelper.getAllInfrastructure()) }
     LaunchedEffect(Unit) {
         bikeCargos = dbHelper.getCargoByStatus("ON_BIKE")
         cargoList = bikeCargos
+        infrastructures = dbHelper.getAllInfrastructure()
     }
 
     val refreshBikeCargos = {
@@ -619,7 +621,10 @@ fun MapScreen(onBack: () -> Unit) {
                                         previousLocation = loc
                                         var cargoDelivered = false
 
-                                        if (baseLocation != null && currentGeo.distanceToAsDouble(baseLocation!!) <= 50.0) {
+                                        val nearbyInfra = infrastructures.find { currentGeo.distanceToAsDouble(it.location) <= 50.0 }
+                                        val isAtBase = baseLocation != null && currentGeo.distanceToAsDouble(baseLocation!!) <= 50.0
+
+                                        if (isAtBase || nearbyInfra != null) {
                                             val cargosForBase = bikeCargos.filter { it.location.distanceToAsDouble(baseLocation!!) < 10.0 }
                                             if (cargosForBase.isNotEmpty()) {
                                                 var earnedXp = 0
@@ -638,7 +643,8 @@ fun MapScreen(onBack: () -> Unit) {
                                                 }
 
                                                 savePlayerMoney(context, playerMoney)
-                                                tts.speak("Возврат на базу. Сдано попутных грузов: ${cargosForBase.size}. Заработано $earnedMoney кредитов.", TextToSpeech.QUEUE_ADD, null, "nav")
+                                                val placeName = if (isAtBase) "на базу" else "в почтовый ящик"
+                                                tts.speak("Груз успешно сдан $placeName. Сдано посылок: ${cargosForBase.size}. Заработано $earnedMoney кредитов.", TextToSpeech.QUEUE_ADD, null, "nav")
                                                 android.widget.Toast.makeText(context, "База: Сдано грузов (${cargosForBase.size} шт)\n+$earnedXp XP\n+$earnedMoney 💵", android.widget.Toast.LENGTH_LONG).show()
 
                                                 cargoDelivered = true
@@ -748,7 +754,17 @@ fun MapScreen(onBack: () -> Unit) {
                     }
                     mapView.overlays.add(baseCircle)
                 }
-
+// --- ОТРИСОВКА ПОСТРОЕК ---
+                infrastructures.forEach { infra ->
+                    val marker = Marker(mapView).apply {
+                        position = infra.location
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                        icon = createInfraMarker(context, "📮")
+                        title = "Почтовый ящик"
+                        setOnMarkerClickListener { _, _ -> true }
+                    }
+                    mapView.overlays.add(marker)
+                }
                 if (isGridEditMode || !isRouteBuilt) {
                     citySectors.forEach { sector ->
                         val hexPolygon = Polygon(mapView).apply {
@@ -992,6 +1008,24 @@ fun MapScreen(onBack: () -> Unit) {
                                 modifier = Modifier.fillMaxWidth()
                             ) { Text("Проложить маршрут") }
                         }
+                    }
+                }
+                // --- КНОПКА ПОСТРОЙКИ ПХК ---
+                val pccCargo = bikeCargos.find { it.name.contains("ПХК") }
+                if (pccCargo != null) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = {
+                            dbHelper.deleteCargo(pccCargo.id)
+                            dbHelper.addInfrastructure("POSTBOX", userPosition!!)
+                            infrastructures = dbHelper.getAllInfrastructure()
+                            refreshBikeCargos()
+                            tts.speak("Объект возведен. Хиральная сеть расширена.", TextToSpeech.QUEUE_FLUSH, null, "build")
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF00ACC1)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Построить Почтовый ящик (Использовать ПХК)")
                     }
                 }
             }
@@ -1357,8 +1391,7 @@ fun getRandomCargoByChance(templates: List<CargoTemplate>): CargoTemplate {
     return templates.last()
 }
 
-enum class ScreenState { HUB, MAP, WAREHOUSE, CONTRACTS, STATS, HEATMAP }
-
+enum class ScreenState { HUB, MAP, WAREHOUSE, CONTRACTS, STATS, HEATMAP, FABRICATOR }
 fun calculateEstimatedRoute(start: GeoPoint, cargos: List<CargoItem>): Double {
     if (cargos.isEmpty()) return 0.0
     var dist = 0.0
@@ -1502,7 +1535,68 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
         }
     }
 }
+@Composable
+fun FabricatorScreen(dbHelper: DatabaseHelper, onBack: () -> Unit) {
+    val context = LocalContext.current
+    var playerMoney by remember { mutableStateOf(loadPlayerMoney(context)) }
 
+    val recipes by remember { mutableStateOf(
+        try {
+            val jsonString = context.assets.open("recipes_db.json").bufferedReader().use { it.readText() }
+            Gson().fromJson<List<RecipeTemplate>>(jsonString, object : TypeToken<List<RecipeTemplate>>() {}.type)
+        } catch (e: Exception) {
+            listOf(RecipeTemplate("pcc_1", "ПХК Ур.1 (Почтовый ящик)", "Позволяет возвести Почтовый ящик.", 5.0, 2500))
+        }
+    )}
+
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("Хиральный принтер", style = MaterialTheme.typography.titleLarge)
+                IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Назад") }
+            }
+            Text("Баланс: $playerMoney 💵", style = MaterialTheme.typography.titleMedium, color = androidx.compose.ui.graphics.Color(0xFF4CAF50))
+            Spacer(modifier = Modifier.height(16.dp))
+
+            LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                items(recipes) { recipe ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp).fillMaxWidth()) {
+                            Text(recipe.name, style = MaterialTheme.typography.titleMedium)
+                            Text(recipe.description, style = MaterialTheme.typography.bodySmall, color = androidx.compose.ui.graphics.Color.Gray)
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text("Вес: ${recipe.weightKg} кг | Цена: ${recipe.costMoney} 💵", style = MaterialTheme.typography.bodyMedium)
+                                Button(
+                                    onClick = {
+                                        if (playerMoney >= recipe.costMoney) {
+                                            playerMoney -= recipe.costMoney
+                                            savePlayerMoney(context, playerMoney)
+
+                                            val newItem = CargoItem(
+                                                id = 0, name = recipe.name, description = recipe.description,
+                                                weightKg = recipe.weightKg, isFragile = false, location = GeoPoint(0.0,0.0),
+                                                xpReward = 0, moneyReward = 0, status = CargoStatus.PENDING, health = 100.0
+                                            )
+                                            dbHelper.addCargoToWarehouse(newItem)
+                                            android.widget.Toast.makeText(context, "Создано и отправлено на склад!", android.widget.Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            android.widget.Toast.makeText(context, "Недостаточно кредитов!", android.widget.Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF00ACC1))
+                                ) { Text("Создать") }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 @Composable
 fun AppNavigation() {
     var currentScreen by remember { mutableStateOf(ScreenState.HUB) }
@@ -1518,13 +1612,15 @@ fun AppNavigation() {
             onNavigateToMap = { currentScreen = ScreenState.MAP },
             onNavigateToWarehouse = { currentScreen = ScreenState.WAREHOUSE },
             onNavigateToContracts = { currentScreen = ScreenState.CONTRACTS },
-            onNavigateToStats = { currentScreen = ScreenState.STATS }
+            onNavigateToStats = { currentScreen = ScreenState.STATS },
+            onNavigateToFabricator = { currentScreen = ScreenState.FABRICATOR } //
         )
         ScreenState.MAP -> MapScreen(onBack = { currentScreen = ScreenState.HUB })
         ScreenState.WAREHOUSE -> WarehouseScreen(dbHelper = dbHelper, onClose = { currentScreen = ScreenState.HUB })
         ScreenState.CONTRACTS -> ContractsMapScreen(dbHelper = dbHelper, onBack = { currentScreen = ScreenState.HUB })
         ScreenState.STATS -> StatsScreen(onBack = { currentScreen = ScreenState.HUB }, onShowHeatmap = { currentScreen = ScreenState.HEATMAP })
         ScreenState.HEATMAP -> HeatmapScreen(onBack = { currentScreen = ScreenState.STATS })
+        ScreenState.FABRICATOR -> FabricatorScreen(dbHelper = dbHelper, onBack = { currentScreen = ScreenState.HUB })
     }
 }
 
@@ -1533,7 +1629,8 @@ fun MainHubScreen(
     onNavigateToMap: () -> Unit,
     onNavigateToWarehouse: () -> Unit,
     onNavigateToContracts: () -> Unit,
-    onNavigateToStats: () -> Unit
+    onNavigateToStats: () -> Unit,
+    onNavigateToFabricator: () -> Unit
 ) {
     val context = LocalContext.current
     val playerXp = loadPlayerXp(context)
@@ -1577,6 +1674,11 @@ fun MainHubScreen(
 
             Button(onClick = onNavigateToWarehouse, modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)) {
                 Text("Личное хранилище (Склад)", style = MaterialTheme.typography.titleMedium)
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(onClick = onNavigateToFabricator, modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp), colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF00ACC1))) {
+                Text("Создание снаряжения (Принтер)", style = MaterialTheme.typography.titleMedium)
             }
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -2253,6 +2355,22 @@ suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Di
     return@withContext null
 }
 
+fun createInfraMarker(context: android.content.Context, emoji: String): android.graphics.drawable.Drawable {
+    val bitmap = android.graphics.Bitmap.createBitmap(100, 100, android.graphics.Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bitmap)
+    val paint = android.graphics.Paint().apply {
+        color = android.graphics.Color.parseColor("#00ACC1")
+        style = android.graphics.Paint.Style.FILL
+        isAntiAlias = true
+    }
+    canvas.drawRoundRect(android.graphics.RectF(0f, 0f, 100f, 100f), 20f, 20f, paint)
+    paint.color = android.graphics.Color.WHITE
+    paint.textSize = 50f
+    paint.textAlign = android.graphics.Paint.Align.CENTER
+    canvas.drawText(emoji, 50f, 65f, paint)
+    return android.graphics.drawable.BitmapDrawable(context.resources, bitmap)
+}
+
 @Composable
 fun StatsScreen(onBack: () -> Unit, onShowHeatmap: () -> Unit) {
     val context = LocalContext.current
@@ -2389,7 +2507,6 @@ fun HeatmapScreen(onBack: () -> Unit) {
         }
     }
 }
-
 class NavService : android.app.Service() {
     override fun onBind(intent: android.content.Intent?): android.os.IBinder? = null
 
