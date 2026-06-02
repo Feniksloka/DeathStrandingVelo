@@ -7,8 +7,8 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import org.osmdroid.util.GeoPoint
 
-// ВНИМАНИЕ: Версия БД изменена на 2!
-class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStorage.db", null, 2) {
+// ВНИМАНИЕ: Версия БД изменена на 3! (Добавили здоровье грузов)
+class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStorage.db", null, 3) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE storage_cells (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, max_weight REAL)")
@@ -21,10 +21,11 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
                 weight REAL,
                 is_fragile INTEGER,
                 xp_reward INTEGER,
-                money_reward INTEGER, -- НОВАЯ КОЛОНКА ДЛЯ ДЕНЕГ
+                money_reward INTEGER,
                 status TEXT,
                 lat REAL,
-                lon REAL
+                lon REAL,
+                health REAL DEFAULT 100.0 -- НОВАЯ КОЛОНКА ДЛЯ СОСТОЯНИЯ ГРУЗА
             )
         """.trimIndent())
 
@@ -45,10 +46,11 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
             put("weight", item.weightKg)
             put("is_fragile", if (item.isFragile) 1 else 0)
             put("xp_reward", item.xpReward)
-            put("money_reward", item.moneyReward) // Сохраняем деньги
+            put("money_reward", item.moneyReward)
             put("status", "IN_WAREHOUSE")
             put("lat", item.location.latitude)
             put("lon", item.location.longitude)
+            put("health", item.health)
         }
         db.insert("cargo_items", null, values)
         db.close()
@@ -68,9 +70,10 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
                 val weight = cursor.getDouble(cursor.getColumnIndex("weight"))
                 val isFragile = cursor.getInt(cursor.getColumnIndex("is_fragile")) == 1
                 val xp = cursor.getInt(cursor.getColumnIndex("xp_reward"))
-                val money = cursor.getInt(cursor.getColumnIndex("money_reward")) // Читаем деньги
+                val money = cursor.getInt(cursor.getColumnIndex("money_reward"))
                 val lat = cursor.getDouble(cursor.getColumnIndex("lat"))
                 val lon = cursor.getDouble(cursor.getColumnIndex("lon"))
+                val health = cursor.getDouble(cursor.getColumnIndex("health")) // Читаем здоровье
 
                 val cargoStatus = when(status) {
                     "ON_BIKE", "IN_WAREHOUSE", "OFFERED", "ACCEPTED" -> CargoStatus.PENDING
@@ -79,7 +82,7 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
                     else -> CargoStatus.PENDING
                 }
 
-                list.add(CargoItem(id, name, desc, weight, isFragile, GeoPoint(lat, lon), xp, money, cargoStatus))
+                list.add(CargoItem(id, name, desc, weight, isFragile, GeoPoint(lat, lon), xp, money, cargoStatus, health))
             } while (cursor.moveToNext())
         }
         cursor.close()
@@ -90,6 +93,14 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
     fun updateCargoStatus(cargoId: Int, newStatus: String) {
         val db = this.writableDatabase
         val values = ContentValues().apply { put("status", newStatus) }
+        db.update("cargo_items", values, "id = ?", arrayOf(cargoId.toString()))
+        db.close()
+    }
+
+    // НОВАЯ ФУНКЦИЯ: Обновление здоровья груза после урона
+    fun updateCargoHealth(cargoId: Int, newHealth: Double) {
+        val db = this.writableDatabase
+        val values = ContentValues().apply { put("health", newHealth) }
         db.update("cargo_items", values, "id = ?", arrayOf(cargoId.toString()))
         db.close()
     }
@@ -125,10 +136,11 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
             put("weight", item.weightKg)
             put("is_fragile", if (item.isFragile) 1 else 0)
             put("xp_reward", item.xpReward)
-            put("money_reward", item.moneyReward) // Сохраняем деньги
+            put("money_reward", item.moneyReward)
             put("status", "ON_BIKE")
             put("lat", item.location.latitude)
             put("lon", item.location.longitude)
+            put("health", item.health)
         }
         db.insert("cargo_items", null, values)
         db.close()
@@ -149,10 +161,11 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
             put("weight", item.weightKg)
             put("is_fragile", if (item.isFragile) 1 else 0)
             put("xp_reward", item.xpReward)
-            put("money_reward", item.moneyReward) // Сохраняем деньги
+            put("money_reward", item.moneyReward)
             put("status", customStatus)
             put("lat", item.location.latitude)
             put("lon", item.location.longitude)
+            put("health", item.health)
         }
         db.insert("cargo_items", null, values)
         db.close()

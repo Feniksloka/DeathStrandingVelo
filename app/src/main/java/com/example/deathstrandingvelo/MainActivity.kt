@@ -16,6 +16,7 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -66,7 +67,11 @@ import androidx.compose.ui.zIndex
 import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.foundation.background
+
+// --- НОВЫЕ КЛАССЫ ДЛЯ ДОЖДЯ И ТВАРЕЙ ---
+data class BTZone(val center: GeoPoint, val radius: Double = 50.0) // Радиус 50м = Диаметр 100м
+data class TimefallZone(val center: GeoPoint, val radius: Double = 250.0, val btZones: List<BTZone>) // Радиус 250м = Диаметр 500м
+
 data class CargoTemplate(
     val name: String,
     val description: String,
@@ -87,7 +92,8 @@ data class CargoItem(
     val location: GeoPoint,
     val xpReward: Int,
     val moneyReward: Int,
-    var status: CargoStatus = CargoStatus.PENDING
+    var status: CargoStatus = CargoStatus.PENDING,
+    var health: Double = 100.0 // НОВОЕ: Состояние груза (0-100%)
 )
 
 data class LevelTemplate(val level: Int, val title: String, val requiredXp: Int)
@@ -178,6 +184,13 @@ fun MapScreen(onBack: () -> Unit) {
     var pendingSideQuestLocation by remember { mutableStateOf<GeoPoint?>(null) }
     var showSideQuestDialog by remember { mutableStateOf(false) }
 
+    // --- ПЕРЕМЕННЫЕ ДЛЯ ДОЖДЯ И ТВАРЕЙ ---
+    var timefallZones by remember { mutableStateOf<List<TimefallZone>>(emptyList()) }
+    var inTimefall by remember { mutableStateOf(false) }
+    var inBtZone by remember { mutableStateOf(false) }
+    var lastTimefallDamageTime by remember { mutableStateOf(0L) }
+    var lastBtAttackTime by remember { mutableStateOf(0L) }
+
     val audioManager = remember { context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager }
     val focusRequest = remember {
         AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
@@ -259,7 +272,6 @@ fun MapScreen(onBack: () -> Unit) {
     var distanceTraveledMeters by remember { mutableStateOf(0.0) }
     var previousLocation by remember { mutableStateOf<android.location.Location?>(null) }
 
-    var selectedMinutes by remember { mutableStateOf(60) }
     var isRouteBuilt by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var hasZoomedToRoute by remember { mutableStateOf(false) }
@@ -274,7 +286,6 @@ fun MapScreen(onBack: () -> Unit) {
         val nextCargo = cargoList.firstOrNull { it.status == CargoStatus.PENDING }
         if (nextCargo != null) {
             val fragileWarning = if (nextCargo.isFragile) "Груз хрупкий, требует внимания." else ""
-            // Используем QUEUE_ADD, чтобы фраза встала в очередь после фразы "Груз доставлен"
             tts.speak("Следующий груз: ${nextCargo.name}. ${nextCargo.description}. $fragileWarning", TextToSpeech.QUEUE_ADD, null, "nav")
         } else {
             tts.speak("Все грузы обработаны. Заказ выполнен, возвращайтесь на базу.", TextToSpeech.QUEUE_ADD, null, "nav")
@@ -287,7 +298,6 @@ fun MapScreen(onBack: () -> Unit) {
 
         if (newStatus == CargoStatus.COLLECTED && targetCargo != null) {
             addTotalDeliveries(context, 1)
-            // Ищем гекс, в котором мы доставили груз, и увеличиваем его счетчик
             val sector = citySectors.minByOrNull { it.center.distanceToAsDouble(targetCargo.location) }
             if (sector != null && sector.center.distanceToAsDouble(targetCargo.location) < 600.0) {
                 citySectors = citySectors.map { if (it.id == sector.id) it.copy(visitCount = it.visitCount + 1) else it }
@@ -296,18 +306,25 @@ fun MapScreen(onBack: () -> Unit) {
 
             val oldLevel = levelsDb.lastOrNull { playerXp >= it.requiredXp } ?: levelsDb.first()
 
-            playerXp += targetCargo.xpReward
-            playerMoney += targetCargo.moneyReward
+            // СЧИТАЕМ НАГРАДУ С УЧЕТОМ УРОНА
+            val healthMult = targetCargo.health / 100.0
+            val finalXp = (targetCargo.xpReward * healthMult).roundToInt()
+            val finalMoney = (targetCargo.moneyReward * healthMult).roundToInt()
+
+            playerXp += finalXp
+            playerMoney += finalMoney
             savePlayerXp(context, playerXp)
             savePlayerMoney(context, playerMoney)
             updateNotification(playerXp)
 
             val newLevel = levelsDb.lastOrNull { playerXp >= it.requiredXp } ?: levelsDb.first()
 
+            val conditionText = "Состояние: ${targetCargo.health.toInt()} процентов."
+
             if (newLevel.level > oldLevel.level) {
-                tts.speak("Груз доставлен. Уровень повышен! Теперь вы: ${newLevel.title}.", TextToSpeech.QUEUE_FLUSH, null, "nav")
+                tts.speak("Груз доставлен. $conditionText Уровень повышен! Теперь вы: ${newLevel.title}.", TextToSpeech.QUEUE_FLUSH, null, "nav")
             } else {
-                tts.speak("Груз доставлен. Получено ${targetCargo.xpReward} опыта и ${targetCargo.moneyReward} кредитов.", TextToSpeech.QUEUE_FLUSH, null, "nav")
+                tts.speak("Груз доставлен. $conditionText Получено $finalXp опыта и $finalMoney кредитов.", TextToSpeech.QUEUE_FLUSH, null, "nav")
             }
 
             val newHistory = visitedPoints + targetCargo.location
@@ -481,6 +498,62 @@ fun MapScreen(onBack: () -> Unit) {
                                             val distStep = previousLocation!!.distanceTo(loc).toDouble()
                                             distanceSinceLastEventCheck += distStep
 
+                                            // --- ЛОГИКА ДОЖДЯ И ТВАРЕЙ ---
+                                            val now = System.currentTimeMillis()
+                                            val speedKmh = if (loc.hasSpeed()) loc.speed * 3.6 else 0.0
+
+                                            val currentTimefall = timefallZones.find { currentGeo.distanceToAsDouble(it.center) <= it.radius }
+                                            if (currentTimefall != null) {
+                                                if (!inTimefall) {
+                                                    inTimefall = true
+                                                    tts.speak("Внимание. Вы входите в зону темпорального дождя. Контейнеры получают урон.", TextToSpeech.QUEUE_ADD, null, "timefall")
+                                                }
+
+                                                // Урон от дождя: 1% каждые 10 секунд
+                                                if (now - lastTimefallDamageTime > 10000) {
+                                                    lastTimefallDamageTime = now
+                                                    bikeCargos.forEach { cargo ->
+                                                        val newHealth = (cargo.health - 1.0).coerceAtLeast(0.0)
+                                                        dbHelper.updateCargoHealth(cargo.id, newHealth)
+                                                    }
+                                                    refreshBikeCargos()
+                                                }
+
+                                                // Проверка на Тварей внутри дождя
+                                                val currentBt = currentTimefall.btZones.find { currentGeo.distanceToAsDouble(it.center) <= it.radius }
+                                                if (currentBt != null) {
+                                                    if (!inBtZone) {
+                                                        inBtZone = true
+                                                        tts.speak("Обнаружено присутствие Тварей. Снизьте скорость до 5 километров в час.", TextToSpeech.QUEUE_ADD, null, "bt_warn")
+                                                    }
+
+                                                    // Урон от Тварей: 10% от остатка, если скорость > 5 км/ч
+                                                    if (speedKmh > 5.0) {
+                                                        if (now - lastBtAttackTime > 15000) { // Кулдаун атаки 15 сек
+                                                            lastBtAttackTime = now
+                                                            tts.speak("Твари заметили вас! Груз поврежден.", TextToSpeech.QUEUE_ADD, null, "bt_attack")
+                                                            bikeCargos.forEach { cargo ->
+                                                                val newHealth = (cargo.health * 0.9).coerceAtLeast(0.0)
+                                                                dbHelper.updateCargoHealth(cargo.id, newHealth)
+                                                            }
+                                                            refreshBikeCargos()
+                                                        }
+                                                    }
+                                                } else {
+                                                    if (inBtZone) {
+                                                        inBtZone = false
+                                                        tts.speak("Вы покинули зону Тварей.", TextToSpeech.QUEUE_ADD, null, "bt_leave")
+                                                    }
+                                                }
+                                            } else {
+                                                if (inTimefall) {
+                                                    inTimefall = false
+                                                    inBtZone = false
+                                                    tts.speak("Темпоральный дождь закончился.", TextToSpeech.QUEUE_ADD, null, "timefall_leave")
+                                                }
+                                            }
+
+                                            // --- СЛУЧАЙНЫЕ СОБЫТИЯ (SOS) ---
                                             if (distanceSinceLastEventCheck >= 1000.0 && pendingSideQuestLocation == null) {
                                                 distanceSinceLastEventCheck = 0.0
                                                 val roll = Random.nextInt(1, 101)
@@ -494,6 +567,7 @@ fun MapScreen(onBack: () -> Unit) {
                                                     currentEventChance += 1
                                                 }
                                             }
+
                                             var minDistanceToLine = Double.MAX_VALUE
                                             if (routePoints.size > 1) {
                                                 for (i in 0 until routePoints.size - 1) {
@@ -503,10 +577,10 @@ fun MapScreen(onBack: () -> Unit) {
                                             }
 
                                             if (loc.accuracy < 50f && minDistanceToLine > 150.0) {
-                                                val now = System.currentTimeMillis()
-                                                if (now - lastOffRouteWarningTime > 60000) {
+                                                val nowTime = System.currentTimeMillis()
+                                                if (nowTime - lastOffRouteWarningTime > 60000) {
                                                     tts.speak("Внимание! Вы отклонились от маршрута.", TextToSpeech.QUEUE_FLUSH, null, "nav")
-                                                    lastOffRouteWarningTime = now
+                                                    lastOffRouteWarningTime = nowTime
                                                 }
                                             }
                                             val nextStep = navSteps.firstOrNull { !it.announcedNow }
@@ -545,7 +619,6 @@ fun MapScreen(onBack: () -> Unit) {
                                         previousLocation = loc
                                         var cargoDelivered = false
 
-                                        // 1. Проверяем доставку на БАЗУ (Радиус уменьшен до 30 метров)
                                         if (baseLocation != null && currentGeo.distanceToAsDouble(baseLocation!!) <= 50.0) {
                                             val cargosForBase = bikeCargos.filter { it.location.distanceToAsDouble(baseLocation!!) < 10.0 }
                                             if (cargosForBase.isNotEmpty()) {
@@ -554,20 +627,22 @@ fun MapScreen(onBack: () -> Unit) {
 
                                                 cargosForBase.forEach {
                                                     dbHelper.updateCargoStatus(it.id, "DELIVERED")
-                                                    playerXp += it.xpReward
-                                                    playerMoney += it.moneyReward
-                                                    earnedXp += it.xpReward
-                                                    earnedMoney += it.moneyReward
+                                                    val healthMult = it.health / 100.0
+                                                    val finalXp = (it.xpReward * healthMult).roundToInt()
+                                                    val finalMoney = (it.moneyReward * healthMult).roundToInt()
+
+                                                    playerXp += finalXp
+                                                    playerMoney += finalMoney
+                                                    earnedXp += finalXp
+                                                    earnedMoney += finalMoney
                                                 }
 
                                                 savePlayerMoney(context, playerMoney)
-
-                                                // Громко и четко сообщаем об успехе!
                                                 tts.speak("Возврат на базу. Сдано попутных грузов: ${cargosForBase.size}. Заработано $earnedMoney кредитов.", TextToSpeech.QUEUE_ADD, null, "nav")
                                                 android.widget.Toast.makeText(context, "База: Сдано грузов (${cargosForBase.size} шт)\n+$earnedXp XP\n+$earnedMoney 💵", android.widget.Toast.LENGTH_LONG).show()
 
                                                 cargoDelivered = true
-                                                addTotalDeliveries(context, cargosForBase.size) // Исправили счетчик статистики!
+                                                addTotalDeliveries(context, cargosForBase.size)
                                             }
                                         }
 
@@ -575,23 +650,32 @@ fun MapScreen(onBack: () -> Unit) {
                                             if (currentGeo.distanceToAsDouble(cargo.location) <= 25.0 && cargo.location.distanceToAsDouble(baseLocation ?: GeoPoint(0.0,0.0)) > 10.0) {
 
                                                 dbHelper.updateCargoStatus(cargo.id, "DELIVERED")
-                                                playerXp += cargo.xpReward
-                                                playerMoney += cargo.moneyReward
+
+                                                val healthMult = cargo.health / 100.0
+                                                val finalXp = (cargo.xpReward * healthMult).roundToInt()
+                                                val finalMoney = (cargo.moneyReward * healthMult).roundToInt()
+
+                                                playerXp += finalXp
+                                                playerMoney += finalMoney
                                                 savePlayerMoney(context, playerMoney)
-                                                tts.speak("Груз доставлен. Получено ${cargo.xpReward} опыта и ${cargo.moneyReward} кредитов.", TextToSpeech.QUEUE_ADD, null, "nav")
+
+                                                val conditionText = "Состояние: ${cargo.health.toInt()} процентов."
+                                                tts.speak("Груз доставлен. $conditionText Получено $finalXp опыта и $finalMoney кредитов.", TextToSpeech.QUEUE_ADD, null, "nav")
+
                                                 cargoDelivered = true
                                                 addTotalDeliveries(context, 1)
+
                                                 val currentWeight = dbHelper.getBikeWeight()
                                                 val template = getRandomCargoByChance(cargoTemplates)
-
                                                 val maxWeight = getCurrentMaxWeight(context)
+
                                                 if (baseLocation != null && currentWeight + template.weightKg <= maxWeight) {
                                                     val returnCargo = CargoItem(
                                                         id = 0, name = template.name, description = template.description,
                                                         weightKg = template.weightKg, isFragile = template.isFragile, location = baseLocation!!,
                                                         xpReward = template.baseXp + Random.nextInt(50, 150),
                                                         moneyReward = template.baseMoney + Random.nextInt(50, 200),
-                                                        status = CargoStatus.PENDING
+                                                        status = CargoStatus.PENDING, health = 100.0
                                                     )
                                                     dbHelper.addCargoToBike(returnCargo)
                                                     tts.speak("Взят попутный груз до базы: ${template.name}. Вес: ${template.weightKg} килограмм.", TextToSpeech.QUEUE_ADD, null, "nav")
@@ -603,7 +687,6 @@ fun MapScreen(onBack: () -> Unit) {
                                             savePlayerXp(context, playerXp)
                                             updateNotification(playerXp)
                                             refreshBikeCargos()
-                                            // Анонсируем следующий груз после авто-доставки
                                             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ announceNext() }, 1000)
                                         }
                                     }
@@ -635,6 +718,27 @@ fun MapScreen(onBack: () -> Unit) {
 
                 mapView.overlays.removeAll { it is Marker || it is Polyline || it is Polygon }
 
+                // --- ОТРИСОВКА ДОЖДЯ И ТВАРЕЙ ---
+                timefallZones.forEach { tf ->
+                    val tfCircle = Polygon(mapView).apply {
+                        points = Polygon.pointsAsCircle(tf.center, tf.radius)
+                        fillPaint.color = android.graphics.Color.parseColor("#33424242") // Полупрозрачный темно-серый
+                        outlinePaint.color = android.graphics.Color.parseColor("#88424242")
+                        outlinePaint.strokeWidth = 2f
+                    }
+                    mapView.overlays.add(tfCircle)
+
+                    tf.btZones.forEach { bt ->
+                        val btCircle = Polygon(mapView).apply {
+                            points = Polygon.pointsAsCircle(bt.center, bt.radius)
+                            fillPaint.color = android.graphics.Color.parseColor("#44000000") // Полупрозрачный черный
+                            outlinePaint.color = android.graphics.Color.parseColor("#88000000")
+                            outlinePaint.strokeWidth = 2f
+                        }
+                        mapView.overlays.add(btCircle)
+                    }
+                }
+
                 if (baseLocation != null) {
                     val baseCircle = Polygon(mapView).apply {
                         points = Polygon.pointsAsCircle(baseLocation, 50.0)
@@ -661,8 +765,6 @@ fun MapScreen(onBack: () -> Unit) {
                             } else {
                                 fillPaint.color = android.graphics.Color.parseColor("#33FF0000")
                             }
-
-                            // Единый нейтральный цвет границ для всей сетки (полупрозрачный темно-серый/черный)
                             outlinePaint.color = android.graphics.Color.parseColor("#66000000")
                             outlinePaint.strokeWidth = 3f
                         }
@@ -848,6 +950,20 @@ fun MapScreen(onBack: () -> Unit) {
 
                                                 cargoList = sortedCargos
 
+                                                // --- ГЕНЕРАЦИЯ ДОЖДЯ И ТВАРЕЙ НА МАРШРУТЕ ---
+                                                val newTimefalls = mutableListOf<TimefallZone>()
+                                                val numTimefalls = (res.distanceMeters / 2500.0).toInt().coerceIn(1, 4)
+                                                val step = res.path.size / (numTimefalls + 1)
+                                                for (i in 1..numTimefalls) {
+                                                    val idx = (i * step).coerceIn(0, res.path.size - 1)
+                                                    val center = res.path[idx]
+                                                    val btZones = List(Random.nextInt(1, 4)) {
+                                                        BTZone(getPointAtAngle(center, Random.nextDouble(0.0, 200.0), Random.nextDouble(0.0, 360.0)))
+                                                    }
+                                                    newTimefalls.add(TimefallZone(center, 250.0, btZones))
+                                                }
+                                                timefallZones = newTimefalls
+
                                                 isFollowMode = true
                                                 shouldInitCamera = true
                                                 hasZoomedToRoute = true
@@ -898,16 +1014,16 @@ fun MapScreen(onBack: () -> Unit) {
                             text = "⭐ ${currentLevel.title}",
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.weight(1f), // Заставляем заголовок уступать место
+                            modifier = Modifier.weight(1f),
                             maxLines = 1,
-                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis // Если не влезет - будут троеточия
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = "$playerXp XP",
                             style = MaterialTheme.typography.bodyMedium,
                             maxLines = 1,
-                            softWrap = false // Запрещаем перенос текста в столбик!
+                            softWrap = false
                         )
                     }
 
@@ -980,7 +1096,7 @@ fun MapScreen(onBack: () -> Unit) {
                         ) {
                             Column(modifier = Modifier.padding(8.dp)) {
                                 Text(cargo.name, style = MaterialTheme.typography.titleSmall)
-                                Text("Статус: ${cargo.status}")
+                                Text("Статус: ${cargo.status} | Состояние: ${cargo.health.toInt()}%")
                             }
                         }
                     }
@@ -1002,6 +1118,7 @@ fun MapScreen(onBack: () -> Unit) {
                     Text("Вес: ${cargo.weightKg} кг")
                     Text("Хрупкий: ${if (cargo.isFragile) "Да" else "Нет"}")
                     Spacer(modifier = Modifier.height(8.dp))
+                    Text("Состояние: ${cargo.health.toInt()}%", color = if (cargo.health < 50) androidx.compose.ui.graphics.Color.Red else MaterialTheme.colorScheme.primary)
                     Text("Статус: ${cargo.status}")
                 }
             },
@@ -1054,7 +1171,7 @@ fun MapScreen(onBack: () -> Unit) {
                                     val xpReward = template.baseXp + (if (template.isFragile) 50 else 0) + Random.nextInt(10, 50)
                                     val moneyReward = template.baseMoney + (if (template.isFragile) 100 else 0) + Random.nextInt(20, 100)
 
-                                    val newCargo = CargoItem(0, template.name, template.description, template.weightKg, template.isFragile, randomSector.center, xpReward, moneyReward, CargoStatus.PENDING)
+                                    val newCargo = CargoItem(0, template.name, template.description, template.weightKg, template.isFragile, randomSector.center, xpReward, moneyReward, CargoStatus.PENDING, 100.0)
                                     dbHelper.addCargoToWarehouse(newCargo)
                                 }
                                 android.widget.Toast.makeText(context, "10 грузов доставлено на склад!", android.widget.Toast.LENGTH_SHORT).show()
@@ -1180,7 +1297,8 @@ fun MapScreen(onBack: () -> Unit) {
                                 location = pendingSideQuestLocation!!,
                                 xpReward = Random.nextInt(300, 800),
                                 moneyReward = Random.nextInt(500, 1500),
-                                status = CargoStatus.PENDING
+                                status = CargoStatus.PENDING,
+                                health = 100.0
                             )
 
                             val collected = cargoList.filter { it.status != CargoStatus.PENDING }
@@ -1267,9 +1385,8 @@ fun getRandomPointInHex(center: GeoPoint): GeoPoint {
 fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
     val context = LocalContext.current
 
-    // Читаем ВСЕ статусы, чтобы ничего не "исчезало"
     var warehouseItems by remember { mutableStateOf(dbHelper.getCargoByStatus("IN_WAREHOUSE")) }
-    var offeredItems by remember { mutableStateOf(dbHelper.getCargoByStatus("OFFERED")) } // Предложенные на карте
+    var offeredItems by remember { mutableStateOf(dbHelper.getCargoByStatus("OFFERED")) }
     var acceptedItems by remember { mutableStateOf(dbHelper.getCargoByStatus("ACCEPTED")) }
     var bikeItems by remember { mutableStateOf(dbHelper.getCargoByStatus("ON_BIKE")) }
 
@@ -1283,11 +1400,9 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
         bikeItems = dbHelper.getCargoByStatus("ON_BIKE")
     }
 
-    // Строим единый список для UI
     data class UiItem(val firstItem: CargoItem, val count: Int, val type: String)
     val unifiedList = mutableListOf<UiItem>()
 
-    // Порядок отображения: Снаряженные -> Контракты -> Предложенные -> Обычные запасы
     bikeItems.groupBy { it.name }.forEach { (_, items) -> unifiedList.add(UiItem(items.first(), items.size, "ON_BIKE")) }
     acceptedItems.groupBy { it.name }.forEach { (_, items) -> unifiedList.add(UiItem(items.first(), items.size, "ACCEPTED")) }
     offeredItems.groupBy { it.name }.forEach { (_, items) -> unifiedList.add(UiItem(items.first(), items.size, "OFFERED")) }
@@ -1307,11 +1422,9 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(8.dp)
             )
 
-            // КНОПКИ УПРАВЛЕНИЯ
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = {
-                        // Авто-загрузка берет ТОЛЬКО принятые контракты
                         var tempWeight = currentWeight
                         for (item in acceptedItems) {
                             if (tempWeight + item.weightKg <= maxWeight) {
@@ -1326,7 +1439,6 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
 
                 OutlinedButton(
                     onClick = {
-                        // Снимаем всё обратно на склад
                         bikeItems.forEach { dbHelper.updateCargoStatus(it.id, "IN_WAREHOUSE") }
                         refreshData()
                     },
@@ -1336,7 +1448,6 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // ЕДИНЫЙ СПИСОК ГРУЗОВ
             if (unifiedList.isEmpty()) {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Text("Склад пуст. Завезите грузы через терминал на карте.", color = androidx.compose.ui.graphics.Color.Gray, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
@@ -1347,7 +1458,6 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
                         val cargo = uiItem.firstItem
                         val count = uiItem.count
 
-                        // Настройка внешнего вида карточки
                         val (bgColor, statusText, statusColor) = when (uiItem.type) {
                             "ON_BIKE" -> Triple(MaterialTheme.colorScheme.primaryContainer, "🟢 Снаряжен (На велике)", MaterialTheme.colorScheme.primary)
                             "ACCEPTED" -> Triple(androidx.compose.ui.graphics.Color(0xFFE8F5E9), "🟠 Требуется доставка", androidx.compose.ui.graphics.Color(0xFF2E7D32))
@@ -1361,11 +1471,9 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
                                 .padding(vertical = 4.dp)
                                 .clickable {
                                     if (uiItem.type == "ON_BIKE") {
-                                        // Снимаем груз обратно на склад
                                         dbHelper.updateCargoStatus(cargo.id, "IN_WAREHOUSE")
                                         refreshData()
                                     } else {
-                                        // Грузим на велик (любой груз: контракт, запас или предложенный)
                                         if (currentWeight + cargo.weightKg <= maxWeight) {
                                             dbHelper.updateCargoStatus(cargo.id, "ON_BIKE")
                                             refreshData()
@@ -1382,10 +1490,9 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
                                     Text("${cargo.weightKg * count} кг", style = MaterialTheme.typography.titleMedium)
                                 }
                                 Spacer(modifier = Modifier.height(4.dp))
-                                // ИСПРАВЛЕННЫЙ UI: Текст разнесен по разным краям карточки
                                 Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                                     Text(statusText, style = MaterialTheme.typography.bodySmall, color = statusColor, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
-                                    Text("${cargo.xpReward * count} XP | ${cargo.moneyReward * count} 💵", style = MaterialTheme.typography.bodySmall)
+                                    Text("Сост: ${cargo.health.toInt()}% | ${cargo.xpReward * count} XP | ${cargo.moneyReward * count} 💵", style = MaterialTheme.typography.bodySmall)
                                 }
                             }
                         }
@@ -1411,13 +1518,13 @@ fun AppNavigation() {
             onNavigateToMap = { currentScreen = ScreenState.MAP },
             onNavigateToWarehouse = { currentScreen = ScreenState.WAREHOUSE },
             onNavigateToContracts = { currentScreen = ScreenState.CONTRACTS },
-            onNavigateToStats = { currentScreen = ScreenState.STATS } // НОВОЕ
+            onNavigateToStats = { currentScreen = ScreenState.STATS }
         )
         ScreenState.MAP -> MapScreen(onBack = { currentScreen = ScreenState.HUB })
         ScreenState.WAREHOUSE -> WarehouseScreen(dbHelper = dbHelper, onClose = { currentScreen = ScreenState.HUB })
         ScreenState.CONTRACTS -> ContractsMapScreen(dbHelper = dbHelper, onBack = { currentScreen = ScreenState.HUB })
-        ScreenState.STATS -> StatsScreen(onBack = { currentScreen = ScreenState.HUB }, onShowHeatmap = { currentScreen = ScreenState.HEATMAP }) // НОВОЕ
-        ScreenState.HEATMAP -> HeatmapScreen(onBack = { currentScreen = ScreenState.STATS }) // НОВОЕ
+        ScreenState.STATS -> StatsScreen(onBack = { currentScreen = ScreenState.HUB }, onShowHeatmap = { currentScreen = ScreenState.HEATMAP })
+        ScreenState.HEATMAP -> HeatmapScreen(onBack = { currentScreen = ScreenState.STATS })
     }
 }
 
@@ -1432,11 +1539,9 @@ fun MainHubScreen(
     val playerXp = loadPlayerXp(context)
     var playerMoney by remember { mutableStateOf(loadPlayerMoney(context)) }
 
-    // Читаем уровни из JSON
     val levelsDb = remember { loadLevelsDb(context) }
     val currentLevel = levelsDb.lastOrNull { playerXp >= it.requiredXp } ?: levelsDb.first()
 
-    // Читаем улучшения из JSON
     var currentUpgradeLevel by remember { mutableStateOf(loadBikeUpgradeLevel(context)) }
     val upgradesDb = remember { loadUpgradesDb(context) }
     val currentUpgrade = upgradesDb.find { it.level == currentUpgradeLevel } ?: upgradesDb.first()
@@ -1517,14 +1622,12 @@ fun MainHubScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // НОВАЯ КНОПКА СТАТИСТИКИ
             TextButton(onClick = onNavigateToStats, modifier = Modifier.fillMaxWidth()) {
                 Text("Личное дело (Статистика)", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
             }
         }
     }
 
-    // ДИАЛОГ ГАРАЖА
     if (showGarageDialog) {
         AlertDialog(
             onDismissRequest = { showGarageDialog = false },
@@ -1779,7 +1882,7 @@ fun ContractsMapScreen(dbHelper: DatabaseHelper, onBack: () -> Unit) {
                         Text("Удлинит маршрут на: +$addedDistKm км (~$addedTimeMins мин)", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.secondary)
                         Spacer(modifier = Modifier.height(4.dp))
 
-                        Text("Будет загружено: ${totalPlannedWeight + cargo.weightKg} / 50.0 кг", style = MaterialTheme.typography.bodySmall)
+                        Text("Будет загружено: ${totalPlannedWeight + cargo.weightKg} / $maxWeight кг", style = MaterialTheme.typography.bodySmall)
                         if (totalPlannedWeight + cargo.weightKg > maxWeight) {
                             Text("⚠️ ПЕРЕГРУЗ! Вы не сможете увезти всё за один раз.", color = androidx.compose.ui.graphics.Color.Red, style = MaterialTheme.typography.bodySmall)
                         }
@@ -1807,7 +1910,6 @@ fun ContractsMapScreen(dbHelper: DatabaseHelper, onBack: () -> Unit) {
         }
     }
 }
-
 fun createDistanceMarker(context: android.content.Context, text: String, color: Int): android.graphics.drawable.Drawable {
     val bitmap = android.graphics.Bitmap.createBitmap(160, 80, android.graphics.Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bitmap)
@@ -1832,127 +1934,6 @@ fun createDistanceMarker(context: android.content.Context, text: String, color: 
     canvas.drawText(text, 80f, 42f, paint)
 
     return android.graphics.drawable.BitmapDrawable(context.resources, bitmap)
-}
-
-suspend fun generateSmartRoute(
-    start: GeoPoint, minutes: Int, sectors: List<CitySector>, visitedHistory: List<GeoPoint>,
-    onResult: (Boolean, String, List<GeoPoint>, List<GeoPoint>, Double, List<RouteStep>, List<Int>) -> Unit
-) {
-    val targetDist = (minutes / 60.0) * 12.0 * 1000.0
-    val requiredSectors = if (minutes <= 30) 2 else 3
-    val maxDistFromStart = targetDist * 0.45
-
-    val activeSectors = sectors.filter { it.isActive && start.distanceToAsDouble(it.center) <= maxDistFromStart }
-
-    if (activeSectors.size < requiredSectors) {
-        val distKm = (maxDistFromStart / 1000.0).roundToInt()
-        onResult(false, "Для $minutes мин. нужно минимум $requiredSectors зеленых гекса в радиусе $distKm км от вас.", emptyList(), emptyList(), 0.0, emptyList(), emptyList())
-        return
-    }
-
-    val maxVisits = activeSectors.maxOfOrNull { it.visitCount } ?: 0
-    val pool = mutableListOf<CitySector>()
-    activeSectors.forEach { sector ->
-        val weight = (maxVisits - sector.visitCount) + 1
-        repeat(weight) { pool.add(sector) }
-    }
-
-    data class RouteCandidate(val sectors: List<CitySector>, val score: Double)
-    val candidates = mutableListOf<RouteCandidate>()
-
-    for (i in 1..100) {
-        val currentChosen = mutableListOf<CitySector>()
-        val tempPool = pool.toMutableList()
-        while (currentChosen.size < requiredSectors && tempPool.isNotEmpty()) {
-            val pick = tempPool.random()
-            currentChosen.add(pick)
-            tempPool.removeAll { it.id == pick.id }
-        }
-
-        if (currentChosen.size < requiredSectors) continue
-
-        var straightDist = start.distanceToAsDouble(currentChosen.first().center)
-        for (j in 0 until currentChosen.size - 1) {
-            straightDist += currentChosen[j].center.distanceToAsDouble(currentChosen[j+1].center)
-        }
-        straightDist += currentChosen.last().center.distanceToAsDouble(start)
-
-        val score = Math.abs(straightDist - (targetDist * 0.8))
-        candidates.add(RouteCandidate(currentChosen, score))
-    }
-
-    val bestCandidates = candidates.sortedBy { it.score }.take(5)
-
-    var bestRes: OsrmResult? = null
-    var chosenSectorIds = listOf<Int>()
-
-    for (candidate in bestCandidates) {
-        val waypoints = mutableListOf<GeoPoint>()
-        waypoints.add(start)
-        waypoints.addAll(candidate.sectors.map { it.center })
-        waypoints.add(start)
-
-        val res = fetchOSRMRoute(waypoints)
-
-        if (res != null) {
-            if (res.distanceMeters == -429.0) {
-                onResult(false, "Лимит запросов API. Подождите 1 минуту.", emptyList(), emptyList(), 0.0, emptyList(), emptyList())
-                return
-            }
-
-            if (res.distanceMeters >= targetDist * 0.7 && res.distanceMeters <= targetDist * 1.4) {
-                bestRes = res
-                chosenSectorIds = candidate.sectors.map { it.id }
-                break
-            }
-
-            if (bestRes == null || Math.abs(res.distanceMeters - targetDist) < Math.abs(bestRes.distanceMeters - targetDist)) {
-                bestRes = res
-                chosenSectorIds = candidate.sectors.map { it.id }
-            }
-        }
-    }
-
-    if (bestRes == null) {
-        onResult(false, "Не удалось получить данные от сервера маршрутов. Проверьте интернет.", emptyList(), emptyList(), 0.0, emptyList(), emptyList())
-        return
-    }
-
-    val cargoPoints = mutableListOf<GeoPoint>()
-    val wpIndices = bestRes.waypointIndices
-
-    val anchorIndices = mutableListOf<Int>()
-    if (wpIndices.size >= 3) {
-        for (i in 1 until wpIndices.size - 1) {
-            anchorIndices.add(wpIndices[i])
-        }
-    }
-
-    var currentSegmentDist = 0.0
-    val cargoInterval = if (minutes <= 30) 2000.0 else 3500.0
-    var nextTarget = Random.nextDouble(cargoInterval * 0.8, cargoInterval * 1.2)
-
-    for (i in 0 until bestRes.path.size - 1) {
-        val d = bestRes.path[i].distanceToAsDouble(bestRes.path[i+1])
-        currentSegmentDist += d
-
-        if (anchorIndices.contains(i + 1)) {
-            cargoPoints.add(bestRes.path[i+1])
-            currentSegmentDist = 0.0
-            nextTarget = Random.nextDouble(cargoInterval * 0.8, cargoInterval * 1.2)
-        }
-        else if (currentSegmentDist >= nextTarget) {
-            cargoPoints.add(bestRes.path[i+1])
-            currentSegmentDist = 0.0
-            nextTarget = Random.nextDouble(cargoInterval * 0.8, cargoInterval * 1.2)
-        }
-    }
-
-    if (cargoPoints.isEmpty() && bestRes.path.size > 2) {
-        cargoPoints.add(bestRes.path[bestRes.path.size / 2])
-    }
-
-    onResult(true, "", cargoPoints, bestRes.path, bestRes.distanceMeters, bestRes.steps, chosenSectorIds)
 }
 
 fun createContractMarker(context: android.content.Context, name: String, dist: String, xp: Int, money: Int, color: Int): android.graphics.drawable.Drawable {
@@ -1993,20 +1974,6 @@ fun createContractMarker(context: android.content.Context, name: String, dist: S
     return android.graphics.drawable.BitmapDrawable(context.resources, bitmap)
 }
 
-fun getBearingBetween(p1: GeoPoint, p2: GeoPoint): Float {
-    val loc1 = android.location.Location("").apply { latitude = p1.latitude; longitude = p1.longitude }
-    val loc2 = android.location.Location("").apply { latitude = p2.latitude; longitude = p2.longitude }
-    return loc1.bearingTo(loc2)
-}
-
-fun savePlayerMoney(context: android.content.Context, money: Int) {
-    context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putInt("player_money", money).apply()
-}
-
-fun loadPlayerMoney(context: android.content.Context): Int {
-    return context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getInt("player_money", 0)
-}
-
 fun createUserArrowMarker(context: android.content.Context): android.graphics.drawable.Drawable {
     val bitmap = android.graphics.Bitmap.createBitmap(80, 80, android.graphics.Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bitmap)
@@ -2028,6 +1995,68 @@ fun createCustomMarker(context: android.content.Context, number: Int, color: Int
     return android.graphics.drawable.BitmapDrawable(context.resources, bitmap)
 }
 
+fun getBearingBetween(p1: GeoPoint, p2: GeoPoint): Float {
+    val loc1 = android.location.Location("").apply { latitude = p1.latitude; longitude = p1.longitude }
+    val loc2 = android.location.Location("").apply { latitude = p2.latitude; longitude = p2.longitude }
+    return loc1.bearingTo(loc2)
+}
+
+fun getPointAtAngle(center: GeoPoint, dist: Double, angle: Double): GeoPoint {
+    val rad = 111300.0
+    val dLat = (dist * Math.cos(Math.toRadians(angle))) / rad
+    val dLon = (dist * Math.sin(Math.toRadians(angle))) / (rad * Math.cos(Math.toRadians(center.latitude)))
+    return GeoPoint(center.latitude + dLat, center.longitude + dLon)
+}
+
+fun getDistanceToSegment(p: GeoPoint, a: GeoPoint, b: GeoPoint): Double {
+    val latToM = 111320.0
+    val lonToM = 111320.0 * Math.cos(Math.toRadians(p.latitude))
+
+    val px = p.longitude * lonToM
+    val py = p.latitude * latToM
+    val ax = a.longitude * lonToM
+    val ay = a.latitude * latToM
+    val bx = b.longitude * lonToM
+    val by = b.latitude * latToM
+
+    val l2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
+    if (l2 == 0.0) return p.distanceToAsDouble(a)
+
+    val t = Math.max(0.0, Math.min(1.0, ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2))
+    val projX = ax + t * (bx - ax)
+    val projY = ay + t * (by - ay)
+
+    return Math.sqrt((px - projX) * (px - projX) + (py - projY) * (py - projY))
+}
+
+fun savePlayerMoney(context: android.content.Context, money: Int) {
+    context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putInt("player_money", money).apply()
+}
+
+fun loadPlayerMoney(context: android.content.Context): Int {
+    return context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getInt("player_money", 0)
+}
+
+fun savePlayerXp(context: android.content.Context, xp: Int) {
+    context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putInt("player_xp", xp).apply()
+}
+
+fun loadPlayerXp(context: android.content.Context): Int {
+    return context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getInt("player_xp", 0)
+}
+
+fun saveBaseLocation(context: android.content.Context, geoPoint: GeoPoint) {
+    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
+    prefs.edit().putString("base_lat", geoPoint.latitude.toString()).putString("base_lon", geoPoint.longitude.toString()).apply()
+}
+
+fun loadBaseLocation(context: android.content.Context): GeoPoint? {
+    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
+    val lat = prefs.getString("base_lat", null) ?: return null
+    val lon = prefs.getString("base_lon", null) ?: return null
+    return GeoPoint(lat.toDouble(), lon.toDouble())
+}
+
 fun saveSectors(context: android.content.Context, sectors: List<CitySector>) {
     val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
     prefs.edit().putString("city_sectors", Gson().toJson(sectors)).apply()
@@ -2037,13 +2066,6 @@ fun loadSectors(context: android.content.Context): List<CitySector> {
     val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
     val json = prefs.getString("city_sectors", null) ?: return emptyList()
     return try { Gson().fromJson(json, object : TypeToken<List<CitySector>>() {}.type) } catch (e: Exception) { emptyList() }
-}
-
-fun getPointAtAngle(center: GeoPoint, dist: Double, angle: Double): GeoPoint {
-    val rad = 111300.0
-    val dLat = (dist * Math.cos(Math.toRadians(angle))) / rad
-    val dLon = (dist * Math.sin(Math.toRadians(angle))) / (rad * Math.cos(Math.toRadians(center.latitude)))
-    return GeoPoint(center.latitude + dLat, center.longitude + dLon)
 }
 
 fun saveBikeUpgradeLevel(context: android.content.Context, level: Int) {
@@ -2059,7 +2081,7 @@ fun loadUpgradesDb(context: android.content.Context): List<BikeUpgrade> {
         val jsonString = context.assets.open("upgrades_db.json").bufferedReader().use { it.readText() }
         Gson().fromJson(jsonString, object : TypeToken<List<BikeUpgrade>>() {}.type)
     } catch (e: Exception) {
-        listOf(BikeUpgrade(1, "Стандартный багажник", 50.0, 0)) // Заглушка, если файла нет
+        listOf(BikeUpgrade(1, "Стандартный багажник", 50.0, 0))
     }
 }
 
@@ -2073,7 +2095,6 @@ fun loadLevelsDb(context: android.content.Context): List<LevelTemplate> {
         val jsonString = context.assets.open("levels_db.json").bufferedReader().use { it.readText() }
         Gson().fromJson(jsonString, object : TypeToken<List<LevelTemplate>>() {}.type)
     } catch (e: Exception) {
-        // Идеальная квадратичная прогрессия, если файла нет
         (0..30).map { lvl ->
             val title = when(lvl) {
                 0 -> "Новичок"
@@ -2118,7 +2139,15 @@ fun saveVisitedPoints(context: android.content.Context, points: List<GeoPoint>) 
     context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putString("visited_points", json).apply()
 }
 
-// --- СТАТИСТИКА ---
+fun loadVisitedPoints(context: android.content.Context): List<GeoPoint> {
+    val json = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getString("visited_points", null) ?: return emptyList()
+    return try {
+        val type = object : TypeToken<List<Map<String, Double>>>() {}.type
+        val list: List<Map<String, Double>> = Gson().fromJson(json, type)
+        list.map { GeoPoint(it["lat"]!!, it["lon"]!!) }
+    } catch (e: Exception) { emptyList() }
+}
+
 fun saveTotalDistance(context: android.content.Context, distanceMeters: Double) {
     val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
     val current = prefs.getFloat("total_distance", 0f)
@@ -2171,8 +2200,6 @@ suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Di
         }
 
         if (conn.responseCode != 200) {
-            val errorMsg = conn.errorStream?.bufferedReader()?.use { it.readText() }
-            android.util.Log.e("ORS_ERROR", "Код: ${conn.responseCode}, Ошибка: $errorMsg")
             return@withContext null
         }
 
@@ -2219,60 +2246,13 @@ suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Di
             }
         }
 
-        return@withContext OsrmResult(path, totalDistance, stepsList, waypointIndices) } catch (e: Exception) {
+        return@withContext OsrmResult(path, totalDistance, stepsList, waypointIndices)
+    } catch (e: Exception) {
         e.printStackTrace()
     }
     return@withContext null
 }
 
-fun getDistanceToSegment(p: GeoPoint, a: GeoPoint, b: GeoPoint): Double {
-    val latToM = 111320.0
-    val lonToM = 111320.0 * Math.cos(Math.toRadians(p.latitude))
-
-    val px = p.longitude * lonToM
-    val py = p.latitude * latToM
-    val ax = a.longitude * lonToM
-    val ay = a.latitude * latToM
-    val bx = b.longitude * lonToM
-    val by = b.latitude * latToM
-
-    val l2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
-    if (l2 == 0.0) return p.distanceToAsDouble(a)
-
-    val t = Math.max(0.0, Math.min(1.0, ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2))
-    val projX = ax + t * (bx - ax)
-    val projY = ay + t * (by - ay)
-
-    return Math.sqrt((px - projX) * (px - projX) + (py - projY) * (py - projY))
-}
-
-fun loadVisitedPoints(context: android.content.Context): List<GeoPoint> {
-    val json = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getString("visited_points", null) ?: return emptyList()
-    return try {
-        val list = Gson().fromJson<List<Map<String, Double>>>(json, object : TypeToken<List<Map<String, Double>>>() {}.type)
-        list.map { GeoPoint(it["lat"]!!, it["lon"]!!) }
-    } catch (e: Exception) { emptyList() }
-}
-
-fun savePlayerXp(context: android.content.Context, xp: Int) {
-    context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).edit().putInt("player_xp", xp).apply()
-}
-
-fun loadPlayerXp(context: android.content.Context): Int {
-    return context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE).getInt("player_xp", 0)
-}
-
-fun saveBaseLocation(context: android.content.Context, geoPoint: GeoPoint) {
-    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
-    prefs.edit().putString("base_lat", geoPoint.latitude.toString()).putString("base_lon", geoPoint.longitude.toString()).apply()
-}
-
-fun loadBaseLocation(context: android.content.Context): GeoPoint? {
-    val prefs = context.getSharedPreferences("bike_prefs", android.content.Context.MODE_PRIVATE)
-    val lat = prefs.getString("base_lat", null) ?: return null
-    val lon = prefs.getString("base_lon", null) ?: return null
-    return GeoPoint(lat.toDouble(), lon.toDouble())
-}
 @Composable
 fun StatsScreen(onBack: () -> Unit, onShowHeatmap: () -> Unit) {
     val context = LocalContext.current
@@ -2308,7 +2288,7 @@ fun StatsScreen(onBack: () -> Unit, onShowHeatmap: () -> Unit) {
             Button(
                 onClick = onShowHeatmap,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF2C7FB8)) // Цвет из палитры DarkMint
+                colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF2C7FB8))
             ) {
                 Text("Тепловая карта сети (DarkMint)", style = MaterialTheme.typography.titleMedium)
             }
@@ -2322,15 +2302,14 @@ fun HeatmapScreen(onBack: () -> Unit) {
     val citySectors = remember { loadSectors(context) }
     val baseLocation = remember { loadBaseLocation(context) }
 
-    // Палитра DarkMint (От светлого к темному)
     val darkMintPalette = listOf(
-        "#D4F1D4", // 0: Очень светло-зеленый (Мало доставок)
-        "#A8DDB5", // 1: Мятный
-        "#7BCCC4", // 2: Светло-бирюзовый
-        "#4EB3D3", // 3: Бирюзовый
-        "#2B8CBE", // 4: Сине-зеленый
-        "#0868AC", // 5: Темно-синий
-        "#084081"  // 6: Очень темно-синий (Много доставок)
+        "#D4F1D4",
+        "#A8DDB5",
+        "#7BCCC4",
+        "#4EB3D3",
+        "#2B8CBE",
+        "#0868AC",
+        "#084081"
     )
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -2342,12 +2321,10 @@ fun HeatmapScreen(onBack: () -> Unit) {
                     controller.setZoom(12.0)
                     if (baseLocation != null) controller.setCenter(baseLocation)
 
-                    // Находим максимальное количество визитов, чтобы правильно распределить цвета
                     val maxVisits = citySectors.maxOfOrNull { it.visitCount }?.coerceAtLeast(1) ?: 1
 
                     citySectors.forEach { sector ->
                         if (sector.isActive) {
-                            // ВЫНЕСЛИ РАСЧЕТ ЦВЕТА СЮДА (чтобы его видел и полигон, и маркер)
                             val colorIndex = if (sector.visitCount == 0) 0 else {
                                 val ratio = sector.visitCount.toFloat() / maxVisits.toFloat()
                                 (ratio * (darkMintPalette.size - 1)).roundToInt().coerceIn(0, darkMintPalette.size - 1)
@@ -2361,14 +2338,12 @@ fun HeatmapScreen(onBack: () -> Unit) {
                                 }
                                 points = pts
 
-                                // Делаем цвет полупрозрачным (CC = 80% opacity)
                                 fillPaint.color = android.graphics.Color.parseColor("#CC${hexColorStr.drop(1)}")
-                                outlinePaint.color = android.graphics.Color.parseColor("#88000000") // Полупрозрачный черный контур
+                                outlinePaint.color = android.graphics.Color.parseColor("#66000000")
                                 outlinePaint.strokeWidth = 2f
                             }
                             overlays.add(hexPolygon)
 
-                            // Добавляем циферку доставок по центру гекса
                             if (sector.visitCount > 0) {
                                 val textMarker = Marker(this).apply {
                                     position = sector.center
@@ -2386,7 +2361,6 @@ fun HeatmapScreen(onBack: () -> Unit) {
             modifier = Modifier.fillMaxSize()
         )
 
-        // Кнопка назад
         FloatingActionButton(
             onClick = onBack,
             modifier = Modifier.align(Alignment.TopStart).padding(16.dp),
@@ -2395,7 +2369,6 @@ fun HeatmapScreen(onBack: () -> Unit) {
             Icon(Icons.Filled.ArrowBack, contentDescription = "Назад")
         }
 
-        // Легенда карты
         Card(
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 32.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.9f))
@@ -2416,6 +2389,7 @@ fun HeatmapScreen(onBack: () -> Unit) {
         }
     }
 }
+
 class NavService : android.app.Service() {
     override fun onBind(intent: android.content.Intent?): android.os.IBinder? = null
 
