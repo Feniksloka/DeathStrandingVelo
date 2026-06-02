@@ -7,8 +7,8 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import org.osmdroid.util.GeoPoint
 
-// ВНИМАНИЕ: Версия БД изменена на 3! (Добавили здоровье грузов)
-class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStorage.db", null, 3) {
+// ВНИМАНИЕ: Версия БД изменена на 4! (Добавили инфраструктуру)
+class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStorage.db", null, 4) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE storage_cells (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, max_weight REAL)")
@@ -25,7 +25,17 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
                 status TEXT,
                 lat REAL,
                 lon REAL,
-                health REAL DEFAULT 100.0 -- НОВАЯ КОЛОНКА ДЛЯ СОСТОЯНИЯ ГРУЗА
+                health REAL DEFAULT 100.0
+            )
+        """.trimIndent())
+
+        // НОВАЯ ТАБЛИЦА ДЛЯ ПОСТРОЕК
+        db.execSQL("""
+            CREATE TABLE infrastructure (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT,
+                lat REAL,
+                lon REAL
             )
         """.trimIndent())
 
@@ -35,9 +45,42 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         db.execSQL("DROP TABLE IF EXISTS cargo_items")
         db.execSQL("DROP TABLE IF EXISTS storage_cells")
+        db.execSQL("DROP TABLE IF EXISTS infrastructure")
         onCreate(db)
     }
 
+    // --- ФУНКЦИИ ИНФРАСТРУКТУРЫ ---
+    fun addInfrastructure(type: String, location: GeoPoint) {
+        val db = this.writableDatabase
+        val values = ContentValues().apply {
+            put("type", type)
+            put("lat", location.latitude)
+            put("lon", location.longitude)
+        }
+        db.insert("infrastructure", null, values)
+        db.close()
+    }
+
+    @SuppressLint("Range")
+    fun getAllInfrastructure(): List<Infrastructure> {
+        val list = mutableListOf<Infrastructure>()
+        val db = this.readableDatabase
+        val cursor = db.rawQuery("SELECT * FROM infrastructure", null)
+        if (cursor.moveToFirst()) {
+            do {
+                val id = cursor.getInt(cursor.getColumnIndex("id"))
+                val type = cursor.getString(cursor.getColumnIndex("type"))
+                val lat = cursor.getDouble(cursor.getColumnIndex("lat"))
+                val lon = cursor.getDouble(cursor.getColumnIndex("lon"))
+                list.add(Infrastructure(id, type, GeoPoint(lat, lon)))
+            } while (cursor.moveToNext())
+        }
+        cursor.close()
+        db.close()
+        return list
+    }
+
+    // --- ФУНКЦИИ ГРУЗОВ ---
     fun addCargoToWarehouse(item: CargoItem) {
         val db = this.writableDatabase
         val values = ContentValues().apply {
@@ -73,7 +116,7 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
                 val money = cursor.getInt(cursor.getColumnIndex("money_reward"))
                 val lat = cursor.getDouble(cursor.getColumnIndex("lat"))
                 val lon = cursor.getDouble(cursor.getColumnIndex("lon"))
-                val health = cursor.getDouble(cursor.getColumnIndex("health")) // Читаем здоровье
+                val health = cursor.getDouble(cursor.getColumnIndex("health"))
 
                 val cargoStatus = when(status) {
                     "ON_BIKE", "IN_WAREHOUSE", "OFFERED", "ACCEPTED" -> CargoStatus.PENDING
@@ -97,7 +140,6 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
         db.close()
     }
 
-    // НОВАЯ ФУНКЦИЯ: Обновление здоровья груза после урона
     fun updateCargoHealth(cargoId: Int, newHealth: Double) {
         val db = this.writableDatabase
         val values = ContentValues().apply { put("health", newHealth) }
@@ -108,6 +150,13 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
     fun clearDelivered() {
         val db = this.writableDatabase
         db.delete("cargo_items", "status = ?", arrayOf("DELIVERED"))
+        db.close()
+    }
+
+    // Удалить конкретный груз (используется при постройке ПХК)
+    fun deleteCargo(cargoId: Int) {
+        val db = this.writableDatabase
+        db.delete("cargo_items", "id = ?", arrayOf(cargoId.toString()))
         db.close()
     }
 
