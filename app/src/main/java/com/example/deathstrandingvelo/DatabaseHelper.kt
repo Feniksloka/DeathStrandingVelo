@@ -165,7 +165,16 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
         db.update("cargo_items", values, "id = ?", arrayOf(cargoId.toString()))
         db.close()
     }
-
+    // НОВАЯ ФУНКЦИЯ: Примагничивает груз к дороге
+    fun updateCargoLocation(cargoId: Int, newLat: Double, newLon: Double) {
+        val db = this.writableDatabase
+        val values = ContentValues().apply {
+            put("lat", newLat)
+            put("lon", newLon)
+        }
+        db.update("cargo_items", values, "id = ?", arrayOf(cargoId.toString()))
+        db.close()
+    }
     fun clearDelivered() {
         val db = this.writableDatabase
         db.delete("cargo_items", "status = ?", arrayOf("DELIVERED"))

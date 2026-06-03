@@ -109,9 +109,21 @@ data class RouteStep(
     var announced100: Boolean = false,
     var announcedNow: Boolean = false
 )
-
+data class InfraTemplate(
+    val type: String,
+    val name: String,
+    val costMoney: Int,
+    val requiredMatsKg: Double,
+    val icon: String
+)
 data class OsrmResult(val path: List<GeoPoint>, val distanceMeters: Double, val steps: List<RouteStep>, val waypointIndices: List<Int> = emptyList())
-
+class GeoPointEvaluator : android.animation.TypeEvaluator<GeoPoint> {
+    override fun evaluate(fraction: Float, startValue: GeoPoint, endValue: GeoPoint): GeoPoint {
+        val lat = startValue.latitude + (endValue.latitude - startValue.latitude) * fraction
+        val lon = startValue.longitude + (endValue.longitude - startValue.longitude) * fraction
+        return GeoPoint(lat, lon)
+    }
+}
 class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalPermissionsApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -178,7 +190,21 @@ fun MapScreen(onBack: () -> Unit) {
             listOf(CargoTemplate("Аварийный груз", "База данных не найдена.", 5.0, false, 100, "Материалы", 50, 50))
         }
     )}
+    val infraTemplates by remember { mutableStateOf(
+        try {
+            val jsonString = context.assets.open("infrastructure_db.json").bufferedReader().use { it.readText() }
+            Gson().fromJson<List<InfraTemplate>>(jsonString, object : TypeToken<List<InfraTemplate>>() {}.type)
+        } catch (e: Exception) {
+            // Если файла пока нет, используем дефолтные значения
+            listOf(
+                InfraTemplate("POSTBOX", "Почтовый ящик", 1000, 50.0, "📮"),
+                InfraTemplate("SAFEHOUSE", "Убежище", 5000, 150.0, "⛺")
+            )
+        }
+    )}
 
+    // Переменная-таймер, чтобы диктор не спамил каждую секунду про постройку
+    var lastInfraAlertTime by remember { mutableStateOf(0L) }
     var playerXp by remember { mutableStateOf(loadPlayerXp(context)) }
     var playerMoney by remember { mutableStateOf(loadPlayerMoney(context)) }
 
@@ -456,6 +482,16 @@ fun MapScreen(onBack: () -> Unit) {
                         }
                     }
                     overlays.add(paintOverlay)
+// --- ДОБАВЛЕНО: Постоянный маркер игрока для анимации ---
+                    val userArrowMarker = Marker(this).apply {
+                        id = "USER_MARKER" // Помечаем маркер, чтобы случайно не удалить
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                        icon = createUserArrowMarker(ctx)
+                        setFlat(false)
+                        infoWindow = null
+                        setOnMarkerClickListener { _, _ -> true }
+                    }
+                    overlays.add(userArrowMarker)
 
                     val mapEventsReceiver = object : MapEventsReceiver {
                         override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
@@ -515,8 +551,34 @@ fun MapScreen(onBack: () -> Unit) {
                             if (loc != null) {
                                 post {
                                     val currentGeo = GeoPoint(loc.latitude, loc.longitude)
-                                    userPosition = currentGeo
-                                    if (loc.hasBearing()) currentBearing = loc.bearing
+
+// Плавная анимация маркера по карте (без спама рекомпозиций Compose)
+                                    val marker = overlays.find { it is Marker && it.id == "USER_MARKER" } as? Marker
+                                    if (marker != null) {
+                                        if (marker.position != null && marker.position.distanceToAsDouble(currentGeo) < 100.0) {
+                                            val animator = android.animation.ValueAnimator.ofObject(GeoPointEvaluator(), marker.position, currentGeo)
+                                            animator.duration = 1000L // Длительность анимации 1 сек
+                                            animator.interpolator = android.view.animation.LinearInterpolator()
+                                            animator.addUpdateListener { animation ->
+                                                marker.position = animation.animatedValue as GeoPoint
+                                                invalidate() // Перерисовываем только саму карту
+                                            }
+                                            animator.start()
+                                        } else {
+                                            marker.position = currentGeo // Если прыжок большой (первый фикс), ставим сразу
+                                            invalidate()
+                                        }
+                                    }
+
+// Плавная анимация поворота карты (компаса)
+                                    if (loc.hasBearing()) {
+                                        val bearingAnim = android.animation.ValueAnimator.ofFloat(currentBearing, loc.bearing)
+                                        bearingAnim.duration = 500L
+                                        bearingAnim.addUpdateListener { animation -> currentBearing = animation.animatedValue as Float }
+                                        bearingAnim.start()
+                                    }
+
+                                    userPosition = currentGeo // Обновляем стейт для логики Тварей и маршрутов
 
                                     if (isRouteBuilt) {
                                         if (previousLocation != null) {
@@ -539,8 +601,28 @@ fun MapScreen(onBack: () -> Unit) {
                                                 }
                                             }
 
-                                            val now = System.currentTimeMillis()
+
                                             val speedKmh = if (loc.hasSpeed()) loc.speed * 3.6 else 0.0
+
+                                            // --- ДОБАВЛЕНО: Радар недостроенных баз ---
+                                            val now = System.currentTimeMillis()
+                                            if (now - lastInfraAlertTime > 60000) { // Оповещаем не чаще раза в минуту
+                                                // Проверяем, есть ли на багажнике материалы
+                                                val hasMaterials = bikeCargos.any { it.name.contains("Металл") || it.name.contains("Керамика") || it.name.contains("Материал") }
+
+                                                if (hasMaterials) {
+                                                    // Ищем фундамент в радиусе от 50 до 1000 метров
+                                                    val nearbyPlanned = infrastructures.find {
+                                                        it.status == "PLANNED" && currentGeo.distanceToAsDouble(it.location) in 50.0..1000.0
+                                                    }
+
+                                                    if (nearbyPlanned != null) {
+                                                        val distRounded = (currentGeo.distanceToAsDouble(nearbyPlanned.location) / 10).roundToInt() * 10
+                                                        tts.speak("Внимание. В $distRounded метрах обнаружена незаконченная постройка. У вас есть подходящие материалы для её завершения.", TextToSpeech.QUEUE_ADD, null, "infra_alert")
+                                                        lastInfraAlertTime = now
+                                                    }
+                                                }
+                                            }
 
                                             val currentTimefall = timefallZones.find { currentGeo.distanceToAsDouble(it.center) <= it.radius }
                                             if (currentTimefall != null) {
@@ -612,13 +694,23 @@ fun MapScreen(onBack: () -> Unit) {
                                                 }
                                             }
 
-                                            if (loc.accuracy < 50f && minDistanceToLine > 150.0) {
+
+
+
+
+
+
+                                            // ИСПРАВЛЕНИЕ БАГА 2: Чувствительность отклонения от маршрута
+                                            // Снизили допуск со 150м до 60м. Увеличили терпимость к плохому GPS в кармане.
+                                            if (loc.accuracy < 100f && minDistanceToLine > 30.0) {
                                                 val nowTime = System.currentTimeMillis()
-                                                if (nowTime - lastOffRouteWarningTime > 60000) {
-                                                    tts.speak("Внимание! Вы отклонились от маршрута.", TextToSpeech.QUEUE_FLUSH, null, "nav")
+                                                if (nowTime - lastOffRouteWarningTime > 20000) { // Предупреждаем каждые 30 сек
+                                                    tts.speak("Вы отклонились от маршрута. Вернитесь на дорогу.", TextToSpeech.QUEUE_FLUSH, null, "nav")
                                                     lastOffRouteWarningTime = nowTime
                                                 }
                                             }
+
+                                            // ИСПРАВЛЕНИЕ БАГА 1: Умные и своевременные повороты
                                             val nextStep = navSteps.firstOrNull { !it.announcedNow }
                                             if (nextStep != null) {
                                                 val distToTurn = currentGeo.distanceToAsDouble(nextStep.location)
@@ -626,32 +718,41 @@ fun MapScreen(onBack: () -> Unit) {
                                                 val updatedList = navSteps.toMutableList()
                                                 var changed = false
 
-                                                if (distToTurn in 300.0..600.0 && !nextStep.announced500) {
+                                                if (distToTurn in 200.0..500.0 && !nextStep.announced500) {
                                                     val rounded = (distToTurn / 50).roundToInt() * 50
                                                     tts.speak("Через $rounded метров ${nextStep.instruction}", TextToSpeech.QUEUE_ADD, null, "nav")
                                                     updatedList[stepIndex] = nextStep.copy(announced500 = true)
                                                     changed = true
                                                 }
-                                                else if (distToTurn in 50.0..150.0 && !nextStep.announced100) {
+                                                else if (distToTurn in 40.0..150.0 && !nextStep.announced100) {
                                                     val rounded = (distToTurn / 10).roundToInt() * 10
                                                     tts.speak("Через $rounded метров ${nextStep.instruction}", TextToSpeech.QUEUE_ADD, null, "nav")
                                                     updatedList[stepIndex] = nextStep.copy(announced500 = true, announced100 = true)
                                                     changed = true
                                                 }
-                                                else if (distToTurn < 25.0 && !nextStep.announcedNow) {
-                                                    tts.speak(nextStep.instruction, TextToSpeech.QUEUE_ADD, null, "nav")
+                                                // Срабатывает ровно за 35 метров до перекрестка!
+                                                else if (distToTurn < 35.0 && !nextStep.announcedNow) {
+                                                    tts.speak("Поворот! ${nextStep.instruction}", TextToSpeech.QUEUE_ADD, null, "nav")
                                                     updatedList[stepIndex] = nextStep.copy(announced500 = true, announced100 = true, announcedNow = true)
                                                     changed = true
                                                 }
 
-                                                if (distToTurn > 100.0 && nextStep.announced100 && !nextStep.announcedNow) {
-                                                    updatedList[stepIndex] = nextStep.copy(announcedNow = true)
-                                                    changed = true
+                                                // --- УМНЫЙ АНТИ-ЗАСТРЕВАТЕЛЬ ---
+                                                // Если мы оказались ближе к СЛЕДУЮЩЕМУ повороту, чем к ТЕКУЩЕМУ, значит мы его уже проехали!
+                                                val nextNextStep = navSteps.getOrNull(stepIndex + 1)
+                                                if (nextNextStep != null) {
+                                                    val distToNextNext = currentGeo.distanceToAsDouble(nextNextStep.location)
+                                                    if (distToNextNext < distToTurn) {
+                                                        updatedList[stepIndex] = nextStep.copy(announcedNow = true)
+                                                        changed = true
+                                                    }
                                                 }
 
                                                 if (changed) navSteps = updatedList
                                             }
                                         }
+
+
                                         previousLocation = loc
                                         var cargoDelivered = false
 
@@ -692,7 +793,7 @@ fun MapScreen(onBack: () -> Unit) {
                                         }
 
                                         bikeCargos.forEach { cargo ->
-                                            if (currentGeo.distanceToAsDouble(cargo.location) <= 25.0 && cargo.location.distanceToAsDouble(baseLocation ?: GeoPoint(0.0,0.0)) > 10.0) {
+                                            if (currentGeo.distanceToAsDouble(cargo.location) <= 40.0 && cargo.location.distanceToAsDouble(baseLocation ?: GeoPoint(0.0,0.0)) > 10.0) {
 
                                                 dbHelper.updateCargoStatus(cargo.id, "DELIVERED")
 
@@ -751,17 +852,18 @@ fun MapScreen(onBack: () -> Unit) {
 
                 if (shouldInitCamera) {
                     shouldInitCamera = false
-                    mapView.controller.setZoom(18.0)
+                    mapView.controller.setZoom(19.5)
                     if (userPosition != null) mapView.controller.animateTo(userPosition)
                 }
 
                 if (userPosition != null && !hasCenteredOnUser) {
                     hasCenteredOnUser = true
-                    mapView.controller.setZoom(16.0)
+                    mapView.controller.setZoom(18.0)
                     mapView.controller.animateTo(userPosition)
                 }
 
-                mapView.overlays.removeAll { it is Marker || it is Polyline || it is Polygon }
+                // Удаляем всё, КРОМЕ нашего анимированного маркера игрока
+mapView.overlays.removeAll { (it is Marker && it.id != "USER_MARKER") || it is Polyline || it is Polygon }
 
                 timefallZones.forEach { tf ->
                     val tfCircle = Polygon(mapView).apply {
@@ -935,17 +1037,7 @@ fun MapScreen(onBack: () -> Unit) {
                     }
                 }
 
-                if (userPosition != null) {
-                    val userArrowMarker = Marker(mapView).apply {
-                        position = userPosition
-                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                        icon = createUserArrowMarker(context)
-                        setFlat(false)
-                        infoWindow = null
-                        setOnMarkerClickListener { _, _ -> true }
-                    }
-                    mapView.overlays.add(userArrowMarker)
-                }
+
                 mapView.invalidate()
             },
             modifier = Modifier.fillMaxSize()
@@ -1003,13 +1095,26 @@ fun MapScreen(onBack: () -> Unit) {
                                             if (res.distanceMeters == -429.0) {
                                                 android.widget.Toast.makeText(context, "Лимит сервера. Ждите 1 мин.", android.widget.Toast.LENGTH_LONG).show()
                                             } else {
+                                                // --- ИСПРАВЛЕНИЕ БАГА: ПРИМАГНИЧИВАЕМ ГРУЗЫ К ДОРОГЕ ---
+                                                // Сервер OSRM сам находит ближайшую дорогу. Мы просто берем эти координаты и двигаем туда маркеры!
+                                                val snappedCargos = sortedCargos.mapIndexed { index, cargo ->
+                                                    val pathIndex = res.waypointIndices.getOrNull(index + 1)
+                                                    if (pathIndex != null && pathIndex < res.path.size) {
+                                                        val snappedPt = res.path[pathIndex]
+                                                        dbHelper.updateCargoLocation(cargo.id, snappedPt.latitude, snappedPt.longitude)
+                                                        cargo.copy(location = snappedPt) // Обновляем в памяти
+                                                    } else {
+                                                        cargo
+                                                    }
+                                                }
+
                                                 routePoints = res.path
                                                 navSteps = res.steps
                                                 totalDistanceMeters = res.distanceMeters
                                                 distanceTraveledMeters = 0.0
                                                 previousLocation = null
 
-                                                cargoList = sortedCargos
+                                                cargoList = snappedCargos // Рисуем грузы уже на дороге!
 
                                                 val newTimefalls = mutableListOf<TimefallZone>()
                                                 val numTimefalls = (res.distanceMeters / 2500.0).toInt().coerceIn(1, 4)
@@ -1098,47 +1203,35 @@ fun MapScreen(onBack: () -> Unit) {
         }
 
         // ДИАЛОГ ПРОЕКТИРОВАНИЯ
+        // ДИАЛОГ ПРОЕКТИРОВАНИЯ (Теперь работает через JSON)
         if (showBuildDialog) {
             AlertDialog(
                 onDismissRequest = { showBuildDialog = false },
-                title = { Text("Покупка фундамента") },
+                title = { Text("Проектирование инфраструктуры") },
                 text = {
                     Column {
-                        Text("Выберите тип постройки. Деньги спишутся сразу. Затем нужно привезти материалы с базы.")
+                        Text("Выберите тип постройки. Деньги спишутся сразу. Затем нужно привезти материалы.")
                         Spacer(modifier = Modifier.height(16.dp))
-                        Button(
-                            onClick = {
-                                if (playerMoney >= 1000) {
-                                    playerMoney -= 1000
-                                    savePlayerMoney(context, playerMoney)
-                                    dbHelper.addInfrastructure("POSTBOX", userPosition!!, 50.0)
-                                    infrastructures = dbHelper.getAllInfrastructure()
-                                    showBuildDialog = false
-                                    tts.speak("Фундамент почтового ящика куплен. Требуются материалы.", TextToSpeech.QUEUE_FLUSH, null, "build")
-                                } else {
-                                    android.widget.Toast.makeText(context, "Нужно 1000 кредитов!", android.widget.Toast.LENGTH_SHORT).show()
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) { Text("Почтовый ящик (1000 💵 + 50 кг мат.)") }
 
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        Button(
-                            onClick = {
-                                if (playerMoney >= 5000) {
-                                    playerMoney -= 5000
-                                    savePlayerMoney(context, playerMoney)
-                                    dbHelper.addInfrastructure("SAFEHOUSE", userPosition!!, 150.0)
-                                    infrastructures = dbHelper.getAllInfrastructure()
-                                    showBuildDialog = false
-                                    tts.speak("Фундамент убежища куплен. Требуются материалы.", TextToSpeech.QUEUE_FLUSH, null, "build")
-                                } else {
-                                    android.widget.Toast.makeText(context, "Нужно 5000 кредитов!", android.widget.Toast.LENGTH_SHORT).show()
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) { Text("Убежище (5000 💵 + 150 кг мат.)") }
+                        infraTemplates.forEach { template ->
+                            Button(
+                                onClick = {
+                                    if (playerMoney >= template.costMoney) {
+                                        playerMoney -= template.costMoney
+                                        savePlayerMoney(context, playerMoney)
+                                        dbHelper.addInfrastructure(template.type, userPosition!!, template.requiredMatsKg)
+                                        infrastructures = dbHelper.getAllInfrastructure()
+                                        showBuildDialog = false
+                                        tts.speak("Фундамент заложен: ${template.name}. Требуются материалы.", TextToSpeech.QUEUE_FLUSH, null, "build")
+                                    } else {
+                                        android.widget.Toast.makeText(context, "Нужно ${template.costMoney} кредитов!", android.widget.Toast.LENGTH_SHORT).show()
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                            ) {
+                                Text("${template.icon} ${template.name} (${template.costMoney} 💵 + ${template.requiredMatsKg} кг)", maxLines = 1)
+                            }
+                        }
                     }
                 },
                 confirmButton = { TextButton(onClick = { showBuildDialog = false }) { Text("Отмена") } }
@@ -1426,38 +1519,61 @@ fun MapScreen(onBack: () -> Unit) {
 
                         val pendingCargos = cargoList.filter { it.status == CargoStatus.PENDING }
 
+                        // 1. Сначала генерируем груз SOS-сигнала
+                        val newCargoId = (cargoList.maxOfOrNull { it.id } ?: 0) + 1
+                        val sideQuestCargo = CargoItem(
+                            id = newCargoId,
+                            name = "Утерянный груз (SOS)",
+                            description = "Случайная находка. Содержимое неизвестно.",
+                            weightKg = kotlin.random.Random.nextDouble(2.0, 15.0).roundToInt().toDouble(),
+                            isFragile = kotlin.random.Random.nextBoolean(),
+                            location = pendingSideQuestLocation!!,
+                            xpReward = kotlin.random.Random.nextInt(300, 800),
+                            moneyReward = kotlin.random.Random.nextInt(500, 1500),
+                            status = CargoStatus.PENDING,
+                            health = 100.0
+                        )
+
+                        // 2. Объединяем старые грузы с новым и СОРТИРУЕМ по оптимальному пути
+                        val allPending = pendingCargos + sideQuestCargo
+                        val sortedCargos = sortCargosByNearest(currentPos, allPending)
+
+                        // 3. Строим точки для запроса к серверу
                         val waypoints = mutableListOf<GeoPoint>()
                         waypoints.add(currentPos)
-                        waypoints.add(pendingSideQuestLocation!!)
-                        waypoints.addAll(pendingCargos.map { it.location })
+                        waypoints.addAll(sortedCargos.map { it.location })
                         if (waypoints.last() != homePos) waypoints.add(homePos)
 
                         val newRes = fetchOSRMRoute(waypoints)
 
                         if (newRes != null) {
-                            val newCargoId = (cargoList.maxOfOrNull { it.id } ?: 0) + 1
-                            val sideQuestCargo = CargoItem(
-                                id = newCargoId,
-                                name = "Утерянный груз (SOS)",
-                                description = "Случайная находка. Содержимое неизвестно.",
-                                weightKg = Random.nextDouble(2.0, 15.0).roundToInt().toDouble(),
-                                isFragile = Random.nextBoolean(),
-                                location = pendingSideQuestLocation!!,
-                                xpReward = Random.nextInt(300, 800),
-                                moneyReward = Random.nextInt(500, 1500),
-                                status = CargoStatus.PENDING,
-                                health = 100.0
-                            )
+                            // 4. Примагничиваем ВСЕ грузы (включая ивент) к новой дороге, чтобы они не лежали в полях
+                            val snappedCargos = sortedCargos.mapIndexed { index, cargo ->
+                                val pathIndex = newRes.waypointIndices.getOrNull(index + 1)
+                                if (pathIndex != null && pathIndex < newRes.path.size) {
+                                    val snappedPt = newRes.path[pathIndex]
+                                    // Обновляем в БД только старые грузы, SOS-груз живет пока только в памяти
+                                    if (cargo.id != newCargoId) {
+                                        dbHelper.updateCargoLocation(cargo.id, snappedPt.latitude, snappedPt.longitude)
+                                    }
+                                    cargo.copy(location = snappedPt)
+                                } else {
+                                    cargo
+                                }
+                            }
 
                             val collected = cargoList.filter { it.status != CargoStatus.PENDING }
-                            cargoList = collected + listOf(sideQuestCargo) + pendingCargos
+                            cargoList = collected + snappedCargos
 
                             routePoints = newRes.path
                             navSteps = newRes.steps
-
                             totalDistanceMeters = distanceTraveledMeters + newRes.distanceMeters
 
-                            tts.speak("Маршрут перестроен. Следуйте к новой цели.", TextToSpeech.QUEUE_FLUSH, null, "nav")
+                            // Проверяем, куда алгоритм решил ехать сначала
+                            val firstCargo = snappedCargos.firstOrNull()
+                            val targetName = if (firstCargo?.id == newCargoId) "сигналу" else "ближайшему грузу"
+
+                            tts.speak("Маршрут перестроен. Оптимальная цель обновлена. Следуйте к $targetName.", TextToSpeech.QUEUE_FLUSH, null, "nav")
                         } else {
                             android.widget.Toast.makeText(context, "Не удалось проложить маршрут к сигналу", android.widget.Toast.LENGTH_SHORT).show()
                         }
@@ -2584,9 +2700,28 @@ suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Di
             val segment = segments.getJSONObject(segIdx)
             val stepsJson = segment.getJSONArray("steps")
             for (sIdx in 0 until stepsJson.length()) {
+
                 val step = stepsJson.getJSONObject(sIdx)
-                val instruction = step.getString("instruction")
+                var instruction = step.getString("instruction")
+
+// --- ДОБАВЛЕНО: Адаптация белорусских названий из OSM для русского TTS ---
+                instruction = instruction
+                    .replace("вуліца", "улица", ignoreCase = true)
+                    .replace("завулак", "переулок", ignoreCase = true)
+                    .replace("праспект", "проспект", ignoreCase = true)
+                    .replace("плошча", "площадь", ignoreCase = true)
+                    .replace("шаша", "шоссе", ignoreCase = true)
+                    .replace("набярэжная", "набережная", ignoreCase = true)
+                    .replace("вёска", "деревня", ignoreCase = true)
+                    .replace("аграгарадок", "агрогородок", ignoreCase = true)
+                    // Транслитерация специфичных букв, чтобы русский голос не ломался на названиях
+                    .replace("ў", "у", ignoreCase = true)
+                    .replace("і", "и", ignoreCase = true)
+                    .replace("’", "") // Убираем апостроф, чтобы диктор не запинался
+
                 val wayPoints = step.getJSONArray("way_points")
+
+
                 val geomIndex = wayPoints.getInt(0)
                 val stepGeo = path[geomIndex]
 
