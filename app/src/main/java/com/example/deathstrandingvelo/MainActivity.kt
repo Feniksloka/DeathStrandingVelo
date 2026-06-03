@@ -116,6 +116,7 @@ data class InfraTemplate(
     val requiredMatsKg: Double,
     val icon: String
 )
+data class MuleZone(val center: GeoPoint, val radius: Double = 200.0) // Радиус 200м
 data class OsrmResult(val path: List<GeoPoint>, val distanceMeters: Double, val steps: List<RouteStep>, val waypointIndices: List<Int> = emptyList())
 class GeoPointEvaluator : android.animation.TypeEvaluator<GeoPoint> {
     override fun evaluate(fraction: Float, startValue: GeoPoint, endValue: GeoPoint): GeoPoint {
@@ -218,7 +219,9 @@ fun MapScreen(onBack: () -> Unit) {
     var inBtZone by remember { mutableStateOf(false) }
     var lastTimefallDamageTime by remember { mutableStateOf(0L) }
     var lastBtAttackTime by remember { mutableStateOf(0L) }
-
+    var muleZones by remember { mutableStateOf<List<MuleZone>>(emptyList()) }
+    var inMuleZone by remember { mutableStateOf(false) }
+    var muleSlowStartTime by remember { mutableStateOf(0L) }
     val audioManager = remember { context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager }
     val focusRequest = remember {
         AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
@@ -603,10 +606,56 @@ fun MapScreen(onBack: () -> Unit) {
 
 
                                             val speedKmh = if (loc.hasSpeed()) loc.speed * 3.6 else 0.0
+val now = System.currentTimeMillis() // <-- ДОБАВИЛИ СЮДА, чтобы все блоки видели время
 
+// --- ДОБАВЛЕНО: Механика МУЛов ---
+                                            val currentMule = muleZones.find { currentGeo.distanceToAsDouble(it.center) <= it.radius }
+                                            if (currentMule != null) {
+                                                if (!inMuleZone) {
+                                                    inMuleZone = true
+                                                    tts.speak("Обнаружено сканирование. Вражеская территория МУЛов. Держите скорость выше 10 километров в час!", TextToSpeech.QUEUE_ADD, null, "mule_enter")
+                                                }
+
+                                                if (speedKmh < 10.0) {
+                                                    if (muleSlowStartTime == 0L) {
+                                                        muleSlowStartTime = now
+                                                    } else if (now - muleSlowStartTime > 10000L) { // Добавили L для типа Long
+                                                        muleSlowStartTime = now // Сбрасываем таймер, чтобы не украли всё сразу
+
+                                                        if (bikeCargos.isNotEmpty()) {
+                                                            val stolen = bikeCargos.random()
+                                                            // Меняем статус в БД (STOLEN автоматически станет PENDING на карте)
+                                                            dbHelper.updateCargoStatus(stolen.id, "STOLEN")
+                                                            dbHelper.updateCargoLocation(stolen.id, currentMule.center.latitude, currentMule.center.longitude)
+
+                                                            // Обновляем списки в памяти, чтобы груз сразу появился на карте в центре лагеря
+                                                            bikeCargos = dbHelper.getCargoByStatus("ON_BIKE")
+                                                            val updatedStolen = stolen.copy(status = CargoStatus.PENDING, location = currentMule.center)
+                                                            cargoList = cargoList.map { if (it.id == stolen.id) updatedStolen else it }
+
+                                                            tts.speak("МУЛы догнали вас и похитили груз! Он спрятан в центре их лагеря.", TextToSpeech.QUEUE_FLUSH, null, "mule_steal")
+
+                                                            try { // Вибрация при краже
+                                                                val vibrator = context.getSystemService(android.content.Context.VIBRATOR_SERVICE) as android.os.Vibrator
+                                                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                                                    vibrator.vibrate(android.os.VibrationEffect.createOneShot(500, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+                                                                } else { vibrator.vibrate(500) }
+                                                            } catch (e: Exception) {}
+                                                        }
+                                                    }
+                                                } else {
+                                                    muleSlowStartTime = 0L // Если скорость выше 10 км/ч, сбрасываем таймер захвата
+                                                }
+                                            } else {
+                                                if (inMuleZone) {
+                                                    inMuleZone = false
+                                                    muleSlowStartTime = 0L
+                                                    tts.speak("Вы успешно покинули территорию МУЛов.", TextToSpeech.QUEUE_ADD, null, "mule_leave")
+                                                }
+                                            }
                                             // --- ДОБАВЛЕНО: Радар недостроенных баз ---
-                                            val now = System.currentTimeMillis()
-                                            if (now - lastInfraAlertTime > 60000) { // Оповещаем не чаще раза в минуту
+                                            // --- ДОБАВЛЕНО: Радар недостроенных баз ---
+                                            if (now - lastInfraAlertTime > 60000L) { // Убрали дубликат val now и добавили L
                                                 // Проверяем, есть ли на багажнике материалы
                                                 val hasMaterials = bikeCargos.any { it.name.contains("Металл") || it.name.contains("Керамика") || it.name.contains("Материал") }
 
@@ -884,6 +933,16 @@ mapView.overlays.removeAll { (it is Marker && it.id != "USER_MARKER") || it is P
                         mapView.overlays.add(btCircle)
                     }
                 }
+                // --- ДОБАВЛЕНО: Отрисовка зон МУЛов ---
+                muleZones.forEach { mule ->
+                    val muleCircle = Polygon(mapView).apply {
+                        points = Polygon.pointsAsCircle(mule.center, mule.radius)
+                        fillPaint.color = android.graphics.Color.parseColor("#33FF9800") // Полупрозрачный оранжевый
+                        outlinePaint.color = android.graphics.Color.parseColor("#88FF9800")
+                        outlinePaint.strokeWidth = 3f
+                    }
+                    mapView.overlays.add(muleCircle)
+                }
 
                 if (baseLocation != null) {
                     val baseCircle = Polygon(mapView).apply {
@@ -1128,6 +1187,17 @@ mapView.overlays.removeAll { (it is Marker && it.id != "USER_MARKER") || it is P
                                                     newTimefalls.add(TimefallZone(center, 250.0, btZones))
                                                 }
                                                 timefallZones = newTimefalls
+// --- ДОБАВЛЕНО: Генерация лагерей МУЛов ---
+                                                val newMules = mutableListOf<MuleZone>()
+                                                val numMules = (res.distanceMeters / 4000.0).toInt().coerceIn(1, 3) // 1 лагерь на каждые 4 км
+                                                val stepMules = res.path.size / (numMules + 1)
+                                                for (i in 1..numMules) {
+                                                    val idx = (i * stepMules).coerceIn(0, res.path.size - 1)
+                                                    // Сдвигаем центр лагеря немного в сторону от дороги
+                                                    val center = getPointAtAngle(res.path[idx], kotlin.random.Random.nextDouble(50.0, 150.0), kotlin.random.Random.nextDouble(0.0, 360.0))
+                                                    newMules.add(MuleZone(center, 200.0))
+                                                }
+                                                muleZones = newMules
 
                                                 isFollowMode = true
                                                 shouldInitCamera = true
