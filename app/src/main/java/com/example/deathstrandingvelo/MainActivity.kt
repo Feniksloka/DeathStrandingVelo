@@ -100,7 +100,7 @@ data class LevelTemplate(val level: Int, val title: String, val requiredXp: Int)
 data class BikeUpgrade(val level: Int, val name: String, val maxWeightKg: Double, val costMoney: Int)
 enum class CargoStatus { PENDING, COLLECTED, CANCELED }
 data class CitySector(val id: Int, val center: GeoPoint, var isActive: Boolean = true, var visitCount: Int = 0)
-data class Infrastructure(val id: Int, val type: String, val location: GeoPoint)
+data class Infrastructure(val id: Int, val type: String, val location: GeoPoint, var status: String, var currentMats: Double, var requiredMats: Double)
 data class RecipeTemplate(val id: String, val name: String, val description: String, val weightKg: Double, val costMoney: Int)
 data class RouteStep(
     val location: GeoPoint,
@@ -157,6 +157,7 @@ fun MapScreen(onBack: () -> Unit) {
     var bikeCargos by remember { mutableStateOf(dbHelper.getCargoByStatus("ON_BIKE")) }
     var cargoList by remember { mutableStateOf(bikeCargos) }
     var infrastructures by remember { mutableStateOf(dbHelper.getAllInfrastructure()) }
+
     LaunchedEffect(Unit) {
         bikeCargos = dbHelper.getCargoByStatus("ON_BIKE")
         cargoList = bikeCargos
@@ -186,7 +187,6 @@ fun MapScreen(onBack: () -> Unit) {
     var pendingSideQuestLocation by remember { mutableStateOf<GeoPoint?>(null) }
     var showSideQuestDialog by remember { mutableStateOf(false) }
 
-    // --- ПЕРЕМЕННЫЕ ДЛЯ ДОЖДЯ И ТВАРЕЙ ---
     var timefallZones by remember { mutableStateOf<List<TimefallZone>>(emptyList()) }
     var inTimefall by remember { mutableStateOf(false) }
     var inBtZone by remember { mutableStateOf(false) }
@@ -277,10 +277,20 @@ fun MapScreen(onBack: () -> Unit) {
     var isRouteBuilt by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var hasZoomedToRoute by remember { mutableStateOf(false) }
+    var mediaPlayer by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
+    var isMusicPlayed by remember { mutableStateOf(false) }
 
+    DisposableEffect(Unit) {
+        onDispose {
+            mediaPlayer?.stop()
+            mediaPlayer?.release()
+        }
+    }
     var showListDialog by remember { mutableStateOf(false) }
     var selectedCargo by remember { mutableStateOf<CargoItem?>(null) }
     var showSettingsDialog by remember { mutableStateOf(false) }
+
+    var showBuildDialog by remember { mutableStateOf(false) }
 
     Configuration.getInstance().userAgentValue = context.packageName
 
@@ -308,7 +318,6 @@ fun MapScreen(onBack: () -> Unit) {
 
             val oldLevel = levelsDb.lastOrNull { playerXp >= it.requiredXp } ?: levelsDb.first()
 
-            // СЧИТАЕМ НАГРАДУ С УЧЕТОМ УРОНА
             val healthMult = targetCargo.health / 100.0
             val finalXp = (targetCargo.xpReward * healthMult).roundToInt()
             val finalMoney = (targetCargo.moneyReward * healthMult).roundToInt()
@@ -349,6 +358,22 @@ fun MapScreen(onBack: () -> Unit) {
                 Icon(Icons.Filled.ArrowBack, contentDescription = "На базу")
             }
         }
+
+        // --- КНОПКА ПОКУПКИ ФУНДАМЕНТА ПРЯМО НА КАРТЕ ---
+        if (userPosition != null && !isGridEditMode) {
+            FloatingActionButton(
+                onClick = { showBuildDialog = true },
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = 16.dp)
+                    .zIndex(10f),
+                containerColor = androidx.compose.ui.graphics.Color(0xFF00ACC1),
+                contentColor = androidx.compose.ui.graphics.Color.White
+            ) {
+                Text("🏗️", style = MaterialTheme.typography.titleLarge)
+            }
+        }
+
         if (isGridEditMode) {
             Card(
                 modifier = Modifier
@@ -499,8 +524,21 @@ fun MapScreen(onBack: () -> Unit) {
                                             saveTotalDistance(context, previousLocation!!.distanceTo(loc).toDouble())
                                             val distStep = previousLocation!!.distanceTo(loc).toDouble()
                                             distanceSinceLastEventCheck += distStep
+// --- МУЗЫКА В КОНЦЕ ПУТИ ---
+                                            if (routePoints.isNotEmpty()) {
+                                                val distToFinish = currentGeo.distanceToAsDouble(routePoints.last())
+                                                if (distToFinish <= 1000.0 && !isMusicPlayed) {
+                                                    isMusicPlayed = true
+                                                    try {
+                                                        val musicResId = context.resources.getIdentifier("music", "raw", context.packageName)
+                                                        if (musicResId != 0) {
+                                                            mediaPlayer = android.media.MediaPlayer.create(context, musicResId)
+                                                            mediaPlayer?.start()
+                                                        }
+                                                    } catch (e: Exception) { e.printStackTrace() }
+                                                }
+                                            }
 
-                                            // --- ЛОГИКА ДОЖДЯ И ТВАРЕЙ ---
                                             val now = System.currentTimeMillis()
                                             val speedKmh = if (loc.hasSpeed()) loc.speed * 3.6 else 0.0
 
@@ -511,7 +549,6 @@ fun MapScreen(onBack: () -> Unit) {
                                                     tts.speak("Внимание. Вы входите в зону темпорального дождя. Контейнеры получают урон.", TextToSpeech.QUEUE_ADD, null, "timefall")
                                                 }
 
-                                                // Урон от дождя: 1% каждые 10 секунд
                                                 if (now - lastTimefallDamageTime > 10000) {
                                                     lastTimefallDamageTime = now
                                                     bikeCargos.forEach { cargo ->
@@ -521,7 +558,6 @@ fun MapScreen(onBack: () -> Unit) {
                                                     refreshBikeCargos()
                                                 }
 
-                                                // Проверка на Тварей внутри дождя
                                                 val currentBt = currentTimefall.btZones.find { currentGeo.distanceToAsDouble(it.center) <= it.radius }
                                                 if (currentBt != null) {
                                                     if (!inBtZone) {
@@ -529,9 +565,8 @@ fun MapScreen(onBack: () -> Unit) {
                                                         tts.speak("Обнаружено присутствие Тварей. Снизьте скорость до 5 километров в час.", TextToSpeech.QUEUE_ADD, null, "bt_warn")
                                                     }
 
-                                                    // Урон от Тварей: 10% от остатка, если скорость > 5 км/ч
                                                     if (speedKmh > 5.0) {
-                                                        if (now - lastBtAttackTime > 15000) { // Кулдаун атаки 15 сек
+                                                        if (now - lastBtAttackTime > 15000) {
                                                             lastBtAttackTime = now
                                                             tts.speak("Твари заметили вас! Груз поврежден.", TextToSpeech.QUEUE_ADD, null, "bt_attack")
                                                             bikeCargos.forEach { cargo ->
@@ -555,7 +590,6 @@ fun MapScreen(onBack: () -> Unit) {
                                                 }
                                             }
 
-                                            // --- СЛУЧАЙНЫЕ СОБЫТИЯ (SOS) ---
                                             if (distanceSinceLastEventCheck >= 1000.0 && pendingSideQuestLocation == null) {
                                                 distanceSinceLastEventCheck = 0.0
                                                 val roll = Random.nextInt(1, 101)
@@ -621,11 +655,16 @@ fun MapScreen(onBack: () -> Unit) {
                                         previousLocation = loc
                                         var cargoDelivered = false
 
-                                        val nearbyInfra = infrastructures.find { currentGeo.distanceToAsDouble(it.location) <= 50.0 }
+                                        val nearbyInfra = infrastructures.find { it.status == "BUILT" && currentGeo.distanceToAsDouble(it.location) <= 50.0 }
                                         val isAtBase = baseLocation != null && currentGeo.distanceToAsDouble(baseLocation!!) <= 50.0
 
                                         if (isAtBase || nearbyInfra != null) {
-                                            val cargosForBase = bikeCargos.filter { it.location.distanceToAsDouble(baseLocation!!) < 10.0 }
+                                            if (isAtBase) {
+                                                mediaPlayer?.stop()
+                                                mediaPlayer?.release()
+                                                mediaPlayer = null
+                                            }
+                                            val cargosForBase = bikeCargos.filter { it.location.distanceToAsDouble(baseLocation ?: GeoPoint(0.0,0.0)) < 10.0 }
                                             if (cargosForBase.isNotEmpty()) {
                                                 var earnedXp = 0
                                                 var earnedMoney = 0
@@ -724,11 +763,10 @@ fun MapScreen(onBack: () -> Unit) {
 
                 mapView.overlays.removeAll { it is Marker || it is Polyline || it is Polygon }
 
-                // --- ОТРИСОВКА ДОЖДЯ И ТВАРЕЙ ---
                 timefallZones.forEach { tf ->
                     val tfCircle = Polygon(mapView).apply {
                         points = Polygon.pointsAsCircle(tf.center, tf.radius)
-                        fillPaint.color = android.graphics.Color.parseColor("#33424242") // Полупрозрачный темно-серый
+                        fillPaint.color = android.graphics.Color.parseColor("#33424242")
                         outlinePaint.color = android.graphics.Color.parseColor("#88424242")
                         outlinePaint.strokeWidth = 2f
                     }
@@ -737,7 +775,7 @@ fun MapScreen(onBack: () -> Unit) {
                     tf.btZones.forEach { bt ->
                         val btCircle = Polygon(mapView).apply {
                             points = Polygon.pointsAsCircle(bt.center, bt.radius)
-                            fillPaint.color = android.graphics.Color.parseColor("#44000000") // Полупрозрачный черный
+                            fillPaint.color = android.graphics.Color.parseColor("#44000000")
                             outlinePaint.color = android.graphics.Color.parseColor("#88000000")
                             outlinePaint.strokeWidth = 2f
                         }
@@ -754,17 +792,24 @@ fun MapScreen(onBack: () -> Unit) {
                     }
                     mapView.overlays.add(baseCircle)
                 }
-// --- ОТРИСОВКА ПОСТРОЕК ---
+
+                // --- ОТРИСОВКА ПОСТРОЕК ---
                 infrastructures.forEach { infra ->
                     val marker = Marker(mapView).apply {
                         position = infra.location
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                        icon = createInfraMarker(context, "📮")
-                        title = "Почтовый ящик"
+                        if (infra.status == "PLANNED") {
+                            icon = createInfraMarker(context, "🚧")
+                            title = "Фундамент (${infra.currentMats}/${infra.requiredMats} кг)"
+                        } else {
+                            icon = createInfraMarker(context, if (infra.type == "POSTBOX") "📮" else "⛺")
+                            title = if (infra.type == "POSTBOX") "Почтовый ящик" else "Убежище"
+                        }
                         setOnMarkerClickListener { _, _ -> true }
                     }
                     mapView.overlays.add(marker)
                 }
+
                 if (isGridEditMode || !isRouteBuilt) {
                     citySectors.forEach { sector ->
                         val hexPolygon = Polygon(mapView).apply {
@@ -966,7 +1011,6 @@ fun MapScreen(onBack: () -> Unit) {
 
                                                 cargoList = sortedCargos
 
-                                                // --- ГЕНЕРАЦИЯ ДОЖДЯ И ТВАРЕЙ НА МАРШРУТЕ ---
                                                 val newTimefalls = mutableListOf<TimefallZone>()
                                                 val numTimefalls = (res.distanceMeters / 2500.0).toInt().coerceIn(1, 4)
                                                 val step = res.path.size / (numTimefalls + 1)
@@ -984,7 +1028,10 @@ fun MapScreen(onBack: () -> Unit) {
                                                 shouldInitCamera = true
                                                 hasZoomedToRoute = true
                                                 isRouteBuilt = true
-
+                                                isMusicPlayed = false
+                                                mediaPlayer?.stop()
+                                                mediaPlayer?.release()
+                                                mediaPlayer = null
                                                 val firstPt = routePoints.firstOrNull()
                                                 if (firstPt != null) currentBearing = getBearingBetween(start, firstPt)
 
@@ -1009,26 +1056,93 @@ fun MapScreen(onBack: () -> Unit) {
                             ) { Text("Проложить маршрут") }
                         }
                     }
-                }
-                // --- КНОПКА ПОСТРОЙКИ ПХК ---
-                val pccCargo = bikeCargos.find { it.name.contains("ПХК") }
-                if (pccCargo != null) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = {
-                            dbHelper.deleteCargo(pccCargo.id)
-                            dbHelper.addInfrastructure("POSTBOX", userPosition!!)
-                            infrastructures = dbHelper.getAllInfrastructure()
-                            refreshBikeCargos()
-                            tts.speak("Объект возведен. Хиральная сеть расширена.", TextToSpeech.QUEUE_FLUSH, null, "build")
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF00ACC1)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Построить Почтовый ящик (Использовать ПХК)")
+
+                    // --- КНОПКА ВНЕСЕНИЯ МАТЕРИАЛОВ В ФУНДАМЕНТ ---
+                    val nearbyPlanned = infrastructures.find { it.status == "PLANNED" && userPosition != null && userPosition!!.distanceToAsDouble(it.location) <= 50.0 }
+                    if (nearbyPlanned != null) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(
+                            onClick = {
+                                val matCargos = bikeCargos.filter { it.name.contains("Металл") || it.name.contains("Керамика") || it.name.contains("Материал") }
+                                if (matCargos.isEmpty()) {
+                                    android.widget.Toast.makeText(context, "Нет строительных материалов на багажнике!", android.widget.Toast.LENGTH_SHORT).show()
+                                } else {
+                                    var addedWeight = 0.0
+                                    matCargos.forEach {
+                                        addedWeight += it.weightKg
+                                        dbHelper.deleteCargo(it.id)
+                                    }
+                                    val newMats = nearbyPlanned.currentMats + addedWeight
+                                    val newStatus = if (newMats >= nearbyPlanned.requiredMats) "BUILT" else "PLANNED"
+
+                                    dbHelper.updateInfrastructureMats(nearbyPlanned.id, newMats, newStatus)
+                                    infrastructures = dbHelper.getAllInfrastructure()
+                                    refreshBikeCargos()
+
+                                    if (newStatus == "BUILT") {
+                                        tts.speak("Строительство завершено. Хиральная сеть расширена.", TextToSpeech.QUEUE_FLUSH, null, "build")
+                                    } else {
+                                        val left = nearbyPlanned.requiredMats - newMats
+                                        tts.speak("Материалы внесены. Для завершения требуется еще $left килограмм.", TextToSpeech.QUEUE_FLUSH, null, "build")
+                                    }
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFFF57C00)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Внести материалы (${nearbyPlanned.currentMats} / ${nearbyPlanned.requiredMats} кг)")
+                        }
                     }
                 }
             }
+        }
+
+        // ДИАЛОГ ПРОЕКТИРОВАНИЯ
+        if (showBuildDialog) {
+            AlertDialog(
+                onDismissRequest = { showBuildDialog = false },
+                title = { Text("Покупка фундамента") },
+                text = {
+                    Column {
+                        Text("Выберите тип постройки. Деньги спишутся сразу. Затем нужно привезти материалы с базы.")
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Button(
+                            onClick = {
+                                if (playerMoney >= 1000) {
+                                    playerMoney -= 1000
+                                    savePlayerMoney(context, playerMoney)
+                                    dbHelper.addInfrastructure("POSTBOX", userPosition!!, 50.0)
+                                    infrastructures = dbHelper.getAllInfrastructure()
+                                    showBuildDialog = false
+                                    tts.speak("Фундамент почтового ящика куплен. Требуются материалы.", TextToSpeech.QUEUE_FLUSH, null, "build")
+                                } else {
+                                    android.widget.Toast.makeText(context, "Нужно 1000 кредитов!", android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Почтовый ящик (1000 💵 + 50 кг мат.)") }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Button(
+                            onClick = {
+                                if (playerMoney >= 5000) {
+                                    playerMoney -= 5000
+                                    savePlayerMoney(context, playerMoney)
+                                    dbHelper.addInfrastructure("SAFEHOUSE", userPosition!!, 150.0)
+                                    infrastructures = dbHelper.getAllInfrastructure()
+                                    showBuildDialog = false
+                                    tts.speak("Фундамент убежища куплен. Требуются материалы.", TextToSpeech.QUEUE_FLUSH, null, "build")
+                                } else {
+                                    android.widget.Toast.makeText(context, "Нужно 5000 кредитов!", android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Убежище (5000 💵 + 150 кг мат.)") }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showBuildDialog = false }) { Text("Отмена") } }
+            )
         }
 
         if (isRouteBuilt) {
@@ -1415,6 +1529,76 @@ fun getRandomPointInHex(center: GeoPoint): GeoPoint {
 }
 
 @Composable
+fun FabricatorScreen(dbHelper: DatabaseHelper, onBack: () -> Unit) {
+    val context = LocalContext.current
+    var playerMoney by remember { mutableStateOf(loadPlayerMoney(context)) }
+
+    val recipes by remember { mutableStateOf(
+        try {
+            val jsonString = context.assets.open("recipes_db.json").bufferedReader().use { it.readText() }
+            Gson().fromJson<List<RecipeTemplate>>(jsonString, object : TypeToken<List<RecipeTemplate>>() {}.type)
+        } catch (e: Exception) {
+            listOf(
+                RecipeTemplate("mat_metal_10", "Металл (10 кг)", "Стандартный контейнер с металлом для строительства.", 10.0, 500),
+                RecipeTemplate("mat_ceramics_20", "Керамика (20 кг)", "Тяжелый контейнер для крупных построек.", 20.0, 900)
+            )
+        }
+    )}
+
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("Хиральный принтер", style = MaterialTheme.typography.titleLarge)
+                IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Назад") }
+            }
+            Text("Баланс: $playerMoney 💵", style = MaterialTheme.typography.titleMedium, color = androidx.compose.ui.graphics.Color(0xFF4CAF50))
+            Spacer(modifier = Modifier.height(16.dp))
+
+            LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                items(recipes) { recipe ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp).fillMaxWidth()) {
+                            Text(recipe.name, style = MaterialTheme.typography.titleMedium)
+                            Text(recipe.description, style = MaterialTheme.typography.bodySmall, color = androidx.compose.ui.graphics.Color.Gray)
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "Вес: ${recipe.weightKg} кг\nЦена: ${recipe.costMoney} 💵",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.weight(1f).padding(end = 8.dp)
+                                )
+                                Button(
+                                    onClick = {
+                                        if (playerMoney >= recipe.costMoney) {
+                                            playerMoney -= recipe.costMoney
+                                            savePlayerMoney(context, playerMoney)
+
+                                            val newItem = CargoItem(
+                                                id = 0, name = recipe.name, description = recipe.description,
+                                                weightKg = recipe.weightKg, isFragile = false, location = GeoPoint(0.0,0.0),
+                                                xpReward = 0, moneyReward = 0, status = CargoStatus.PENDING, health = 100.0
+                                            )
+                                            dbHelper.addCargoToWarehouse(newItem)
+                                            android.widget.Toast.makeText(context, "Создано и отправлено на склад!", android.widget.Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            android.widget.Toast.makeText(context, "Недостаточно кредитов!", android.widget.Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF00ACC1))
+                                ) { Text("Создать", maxLines = 1, softWrap = false) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
     val context = LocalContext.current
 
@@ -1535,68 +1719,7 @@ fun WarehouseScreen(dbHelper: DatabaseHelper, onClose: () -> Unit) {
         }
     }
 }
-@Composable
-fun FabricatorScreen(dbHelper: DatabaseHelper, onBack: () -> Unit) {
-    val context = LocalContext.current
-    var playerMoney by remember { mutableStateOf(loadPlayerMoney(context)) }
 
-    val recipes by remember { mutableStateOf(
-        try {
-            val jsonString = context.assets.open("recipes_db.json").bufferedReader().use { it.readText() }
-            Gson().fromJson<List<RecipeTemplate>>(jsonString, object : TypeToken<List<RecipeTemplate>>() {}.type)
-        } catch (e: Exception) {
-            listOf(RecipeTemplate("pcc_1", "ПХК Ур.1 (Почтовый ящик)", "Позволяет возвести Почтовый ящик.", 5.0, 2500))
-        }
-    )}
-
-    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("Хиральный принтер", style = MaterialTheme.typography.titleLarge)
-                IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Назад") }
-            }
-            Text("Баланс: $playerMoney 💵", style = MaterialTheme.typography.titleMedium, color = androidx.compose.ui.graphics.Color(0xFF4CAF50))
-            Spacer(modifier = Modifier.height(16.dp))
-
-            LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                items(recipes) { recipe ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-                    ) {
-                        Column(modifier = Modifier.padding(12.dp).fillMaxWidth()) {
-                            Text(recipe.name, style = MaterialTheme.typography.titleMedium)
-                            Text(recipe.description, style = MaterialTheme.typography.bodySmall, color = androidx.compose.ui.graphics.Color.Gray)
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Text("Вес: ${recipe.weightKg} кг | Цена: ${recipe.costMoney} 💵", style = MaterialTheme.typography.bodyMedium)
-                                Button(
-                                    onClick = {
-                                        if (playerMoney >= recipe.costMoney) {
-                                            playerMoney -= recipe.costMoney
-                                            savePlayerMoney(context, playerMoney)
-
-                                            val newItem = CargoItem(
-                                                id = 0, name = recipe.name, description = recipe.description,
-                                                weightKg = recipe.weightKg, isFragile = false, location = GeoPoint(0.0,0.0),
-                                                xpReward = 0, moneyReward = 0, status = CargoStatus.PENDING, health = 100.0
-                                            )
-                                            dbHelper.addCargoToWarehouse(newItem)
-                                            android.widget.Toast.makeText(context, "Создано и отправлено на склад!", android.widget.Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            android.widget.Toast.makeText(context, "Недостаточно кредитов!", android.widget.Toast.LENGTH_SHORT).show()
-                                        }
-                                    },
-                                    colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color(0xFF00ACC1))
-                                ) { Text("Создать") }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 @Composable
 fun AppNavigation() {
     var currentScreen by remember { mutableStateOf(ScreenState.HUB) }
@@ -1613,7 +1736,7 @@ fun AppNavigation() {
             onNavigateToWarehouse = { currentScreen = ScreenState.WAREHOUSE },
             onNavigateToContracts = { currentScreen = ScreenState.CONTRACTS },
             onNavigateToStats = { currentScreen = ScreenState.STATS },
-            onNavigateToFabricator = { currentScreen = ScreenState.FABRICATOR } //
+            onNavigateToFabricator = { currentScreen = ScreenState.FABRICATOR }
         )
         ScreenState.MAP -> MapScreen(onBack = { currentScreen = ScreenState.HUB })
         ScreenState.WAREHOUSE -> WarehouseScreen(dbHelper = dbHelper, onClose = { currentScreen = ScreenState.HUB })
@@ -1647,8 +1770,9 @@ fun MainHubScreen(
     var showGarageDialog by remember { mutableStateOf(false) }
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        val scrollState = rememberScrollState()
         Column(
-            modifier = Modifier.fillMaxSize().padding(24.dp),
+            modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(scrollState),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
@@ -2012,6 +2136,7 @@ fun ContractsMapScreen(dbHelper: DatabaseHelper, onBack: () -> Unit) {
         }
     }
 }
+
 fun createDistanceMarker(context: android.content.Context, text: String, color: Int): android.graphics.drawable.Drawable {
     val bitmap = android.graphics.Bitmap.createBitmap(160, 80, android.graphics.Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bitmap)
@@ -2036,6 +2161,127 @@ fun createDistanceMarker(context: android.content.Context, text: String, color: 
     canvas.drawText(text, 80f, 42f, paint)
 
     return android.graphics.drawable.BitmapDrawable(context.resources, bitmap)
+}
+
+suspend fun generateSmartRoute(
+    start: GeoPoint, minutes: Int, sectors: List<CitySector>, visitedHistory: List<GeoPoint>,
+    onResult: (Boolean, String, List<GeoPoint>, List<GeoPoint>, Double, List<RouteStep>, List<Int>) -> Unit
+) {
+    val targetDist = (minutes / 60.0) * 12.0 * 1000.0
+    val requiredSectors = if (minutes <= 30) 2 else 3
+    val maxDistFromStart = targetDist * 0.45
+
+    val activeSectors = sectors.filter { it.isActive && start.distanceToAsDouble(it.center) <= maxDistFromStart }
+
+    if (activeSectors.size < requiredSectors) {
+        val distKm = (maxDistFromStart / 1000.0).roundToInt()
+        onResult(false, "Для $minutes мин. нужно минимум $requiredSectors зеленых гекса в радиусе $distKm км от вас.", emptyList(), emptyList(), 0.0, emptyList(), emptyList())
+        return
+    }
+
+    val maxVisits = activeSectors.maxOfOrNull { it.visitCount } ?: 0
+    val pool = mutableListOf<CitySector>()
+    activeSectors.forEach { sector ->
+        val weight = (maxVisits - sector.visitCount) + 1
+        repeat(weight) { pool.add(sector) }
+    }
+
+    data class RouteCandidate(val sectors: List<CitySector>, val score: Double)
+    val candidates = mutableListOf<RouteCandidate>()
+
+    for (i in 1..100) {
+        val currentChosen = mutableListOf<CitySector>()
+        val tempPool = pool.toMutableList()
+        while (currentChosen.size < requiredSectors && tempPool.isNotEmpty()) {
+            val pick = tempPool.random()
+            currentChosen.add(pick)
+            tempPool.removeAll { it.id == pick.id }
+        }
+
+        if (currentChosen.size < requiredSectors) continue
+
+        var straightDist = start.distanceToAsDouble(currentChosen.first().center)
+        for (j in 0 until currentChosen.size - 1) {
+            straightDist += currentChosen[j].center.distanceToAsDouble(currentChosen[j+1].center)
+        }
+        straightDist += currentChosen.last().center.distanceToAsDouble(start)
+
+        val score = Math.abs(straightDist - (targetDist * 0.8))
+        candidates.add(RouteCandidate(currentChosen, score))
+    }
+
+    val bestCandidates = candidates.sortedBy { it.score }.take(5)
+
+    var bestRes: OsrmResult? = null
+    var chosenSectorIds = listOf<Int>()
+
+    for (candidate in bestCandidates) {
+        val waypoints = mutableListOf<GeoPoint>()
+        waypoints.add(start)
+        waypoints.addAll(candidate.sectors.map { it.center })
+        waypoints.add(start)
+
+        val res = fetchOSRMRoute(waypoints)
+
+        if (res != null) {
+            if (res.distanceMeters == -429.0) {
+                onResult(false, "Лимит запросов API. Подождите 1 минуту.", emptyList(), emptyList(), 0.0, emptyList(), emptyList())
+                return
+            }
+
+            if (res.distanceMeters >= targetDist * 0.7 && res.distanceMeters <= targetDist * 1.4) {
+                bestRes = res
+                chosenSectorIds = candidate.sectors.map { it.id }
+                break
+            }
+
+            if (bestRes == null || Math.abs(res.distanceMeters - targetDist) < Math.abs(bestRes.distanceMeters - targetDist)) {
+                bestRes = res
+                chosenSectorIds = candidate.sectors.map { it.id }
+            }
+        }
+    }
+
+    if (bestRes == null) {
+        onResult(false, "Не удалось получить данные от сервера маршрутов. Проверьте интернет.", emptyList(), emptyList(), 0.0, emptyList(), emptyList())
+        return
+    }
+
+    val cargoPoints = mutableListOf<GeoPoint>()
+    val wpIndices = bestRes.waypointIndices
+
+    val anchorIndices = mutableListOf<Int>()
+    if (wpIndices.size >= 3) {
+        for (i in 1 until wpIndices.size - 1) {
+            anchorIndices.add(wpIndices[i])
+        }
+    }
+
+    var currentSegmentDist = 0.0
+    val cargoInterval = if (minutes <= 30) 2000.0 else 3500.0
+    var nextTarget = Random.nextDouble(cargoInterval * 0.8, cargoInterval * 1.2)
+
+    for (i in 0 until bestRes.path.size - 1) {
+        val d = bestRes.path[i].distanceToAsDouble(bestRes.path[i+1])
+        currentSegmentDist += d
+
+        if (anchorIndices.contains(i + 1)) {
+            cargoPoints.add(bestRes.path[i+1])
+            currentSegmentDist = 0.0
+            nextTarget = Random.nextDouble(cargoInterval * 0.8, cargoInterval * 1.2)
+        }
+        else if (currentSegmentDist >= nextTarget) {
+            cargoPoints.add(bestRes.path[i+1])
+            currentSegmentDist = 0.0
+            nextTarget = Random.nextDouble(cargoInterval * 0.8, cargoInterval * 1.2)
+        }
+    }
+
+    if (cargoPoints.isEmpty() && bestRes.path.size > 2) {
+        cargoPoints.add(bestRes.path[bestRes.path.size / 2])
+    }
+
+    onResult(true, "", cargoPoints, bestRes.path, bestRes.distanceMeters, bestRes.steps, chosenSectorIds)
 }
 
 fun createContractMarker(context: android.content.Context, name: String, dist: String, xp: Int, money: Int, color: Int): android.graphics.drawable.Drawable {
@@ -2302,6 +2548,8 @@ suspend fun fetchOSRMRoute(points: List<GeoPoint>): OsrmResult? = withContext(Di
         }
 
         if (conn.responseCode != 200) {
+            val errorMsg = conn.errorStream?.bufferedReader()?.use { it.readText() }
+            android.util.Log.e("ORS_ERROR", "Код: ${conn.responseCode}, Ошибка: $errorMsg")
             return@withContext null
         }
 

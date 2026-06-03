@@ -7,8 +7,8 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import org.osmdroid.util.GeoPoint
 
-// ВНИМАНИЕ: Версия БД изменена на 4! (Добавили инфраструктуру)
-class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStorage.db", null, 4) {
+// ВНИМАНИЕ: Версия БД изменена на 5! (Добавили прогресс строительства)
+class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStorage.db", null, 5) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE storage_cells (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, max_weight REAL)")
@@ -29,13 +29,16 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
             )
         """.trimIndent())
 
-        // НОВАЯ ТАБЛИЦА ДЛЯ ПОСТРОЕК
+        // Таблица построек со статусом и материалами
         db.execSQL("""
             CREATE TABLE infrastructure (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 type TEXT,
                 lat REAL,
-                lon REAL
+                lon REAL,
+                status TEXT DEFAULT 'PLANNED',
+                current_mats REAL DEFAULT 0.0,
+                required_mats REAL DEFAULT 50.0
             )
         """.trimIndent())
 
@@ -50,14 +53,27 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
     }
 
     // --- ФУНКЦИИ ИНФРАСТРУКТУРЫ ---
-    fun addInfrastructure(type: String, location: GeoPoint) {
+    fun addInfrastructure(type: String, location: GeoPoint, requiredMats: Double) {
         val db = this.writableDatabase
         val values = ContentValues().apply {
             put("type", type)
             put("lat", location.latitude)
             put("lon", location.longitude)
+            put("status", "PLANNED")
+            put("current_mats", 0.0)
+            put("required_mats", requiredMats)
         }
         db.insert("infrastructure", null, values)
+        db.close()
+    }
+
+    fun updateInfrastructureMats(id: Int, newMats: Double, newStatus: String) {
+        val db = this.writableDatabase
+        val values = ContentValues().apply {
+            put("current_mats", newMats)
+            put("status", newStatus)
+        }
+        db.update("infrastructure", values, "id = ?", arrayOf(id.toString()))
         db.close()
     }
 
@@ -72,7 +88,10 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
                 val type = cursor.getString(cursor.getColumnIndex("type"))
                 val lat = cursor.getDouble(cursor.getColumnIndex("lat"))
                 val lon = cursor.getDouble(cursor.getColumnIndex("lon"))
-                list.add(Infrastructure(id, type, GeoPoint(lat, lon)))
+                val status = cursor.getString(cursor.getColumnIndex("status"))
+                val currentMats = cursor.getDouble(cursor.getColumnIndex("current_mats"))
+                val requiredMats = cursor.getDouble(cursor.getColumnIndex("required_mats"))
+                list.add(Infrastructure(id, type, GeoPoint(lat, lon), status, currentMats, requiredMats))
             } while (cursor.moveToNext())
         }
         cursor.close()
@@ -153,7 +172,6 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "OdradekStora
         db.close()
     }
 
-    // Удалить конкретный груз (используется при постройке ПХК)
     fun deleteCargo(cargoId: Int) {
         val db = this.writableDatabase
         db.delete("cargo_items", "id = ?", arrayOf(cargoId.toString()))
